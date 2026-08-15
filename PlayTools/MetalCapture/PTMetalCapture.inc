@@ -255,7 +255,11 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_uint_fast64_t _samplingSkipMilliFPS;
     atomic_uint_fast64_t _lastLogTick;
     atomic_uint_fast64_t _lastLogPresented;
+    atomic_uint_fast64_t _lastLogCaptured;
     atomic_uint_fast64_t _lastLogEncoded;
+    atomic_uint_fast64_t _presentMilliFPS;
+    atomic_uint_fast64_t _captureMilliFPS;
+    atomic_uint_fast64_t _encodedMilliFPS;
     atomic_uint_fast64_t _drawableWidth;
     atomic_uint_fast64_t _drawableHeight;
     atomic_int_fast64_t _pixelFormat;
@@ -340,6 +344,12 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
         status[@"samplingSkipped"] = @(samplingSkipped);
         status[@"samplingSkipPerSecond"] = @((double)atomic_load_explicit(
             &manager->_samplingSkipMilliFPS, memory_order_relaxed) / 1000.0);
+        status[@"presentFPS"] = @((double)atomic_load_explicit(
+            &manager->_presentMilliFPS, memory_order_relaxed) / 1000.0);
+        status[@"captureFPS"] = @((double)atomic_load_explicit(
+            &manager->_captureMilliFPS, memory_order_relaxed) / 1000.0);
+        status[@"encodedFPS"] = @((double)atomic_load_explicit(
+            &manager->_encodedMilliFPS, memory_order_relaxed) / 1000.0);
         status[@"codec"] = manager.codecName ?: @"hevc";
         status[@"drawableWidth"] = @(atomic_load_explicit(&manager->_drawableWidth, memory_order_relaxed));
         status[@"drawableHeight"] = @(atomic_load_explicit(&manager->_drawableHeight, memory_order_relaxed));
@@ -878,7 +888,9 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_droppedPool, 0); atomic_init(&_droppedEncoder, 0); atomic_init(&_droppedLate, 0);
         atomic_init(&_droppedUnsupported, 0); atomic_init(&_skippedRate, 0);
         atomic_init(&_lastLogSkipped, 0); atomic_init(&_samplingSkipMilliFPS, 0);
-        atomic_init(&_lastLogTick, mach_continuous_time()); atomic_init(&_lastLogPresented, 0); atomic_init(&_lastLogEncoded, 0);
+        atomic_init(&_lastLogTick, mach_continuous_time());
+        atomic_init(&_lastLogPresented, 0); atomic_init(&_lastLogCaptured, 0); atomic_init(&_lastLogEncoded, 0);
+        atomic_init(&_presentMilliFPS, 0); atomic_init(&_captureMilliFPS, 0); atomic_init(&_encodedMilliFPS, 0);
         atomic_init(&_drawableWidth, 0); atomic_init(&_drawableHeight, 0); atomic_init(&_pixelFormat, -1);
         atomic_init(&_framebufferOnly, -1); atomic_init(&_displaySync, -1); atomic_init(&_edr, -1);
         atomic_init(&_presentHookCount, 0);
@@ -959,6 +971,12 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     atomic_store_explicit(&_skippedRate, 0, memory_order_relaxed);
     atomic_store_explicit(&_lastLogSkipped, 0, memory_order_relaxed);
     atomic_store_explicit(&_samplingSkipMilliFPS, 0, memory_order_relaxed);
+    atomic_store_explicit(&_lastLogPresented, 0, memory_order_relaxed);
+    atomic_store_explicit(&_lastLogCaptured, 0, memory_order_relaxed);
+    atomic_store_explicit(&_lastLogEncoded, 0, memory_order_relaxed);
+    atomic_store_explicit(&_presentMilliFPS, 0, memory_order_relaxed);
+    atomic_store_explicit(&_captureMilliFPS, 0, memory_order_relaxed);
+    atomic_store_explicit(&_encodedMilliFPS, 0, memory_order_relaxed);
     atomic_store_explicit(&_skippedPresents, 0, memory_order_relaxed);
     atomic_store_explicit(&_ownedCaptureCommandBuffers, 0, memory_order_relaxed);
     atomic_store_explicit(&_lastOwnedCaptureGPUTimeUs, 0, memory_order_relaxed);
@@ -1264,18 +1282,26 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     if (!atomic_compare_exchange_strong_explicit(&_lastLogTick, &previous, tick, memory_order_acq_rel, memory_order_relaxed) && !force) return;
     double seconds = MAX((double)elapsedNs / 1e9, 0.001);
     uint64_t p = atomic_load_explicit(&_presented, memory_order_relaxed);
+    uint64_t c = atomic_load_explicit(&_captured, memory_order_relaxed);
     uint64_t e = atomic_load_explicit(&_encoded, memory_order_relaxed);
     uint64_t samplingSkipped = atomic_load_explicit(&_skippedRate, memory_order_relaxed);
     uint64_t lp = atomic_exchange_explicit(&_lastLogPresented, p, memory_order_acq_rel);
+    uint64_t lc = atomic_exchange_explicit(&_lastLogCaptured, c, memory_order_acq_rel);
     uint64_t le = atomic_exchange_explicit(&_lastLogEncoded, e, memory_order_acq_rel);
     uint64_t ls = atomic_exchange_explicit(&_lastLogSkipped, samplingSkipped, memory_order_acq_rel);
+    double presentPerSecond = (p - lp) / seconds;
+    double capturePerSecond = (c - lc) / seconds;
+    double encodedPerSecond = (e - le) / seconds;
     double skipPerSecond = (samplingSkipped - ls) / seconds;
+    atomic_store_explicit(&_presentMilliFPS, (uint64_t)llround(presentPerSecond * 1000.0), memory_order_relaxed);
+    atomic_store_explicit(&_captureMilliFPS, (uint64_t)llround(capturePerSecond * 1000.0), memory_order_relaxed);
+    atomic_store_explicit(&_encodedMilliFPS, (uint64_t)llround(encodedPerSecond * 1000.0), memory_order_relaxed);
     atomic_store_explicit(&_samplingSkipMilliFPS, (uint64_t)llround(skipPerSecond * 1000.0), memory_order_relaxed);
-    PTMC_LOG(@"present=%.2f fps drawable=%llux%llu pixelFormat=%lld displaySync=%lld framebufferOnly=%lld captured=%llu encoded=%.2f fps dropped_pool=%llu dropped_encoder=%llu dropped_late=%llu unsupported=%llu sampling_skips=%llu (%.2f/s) codec=%@ resolution=%@ suppressDisplay=%d skipPresent=%d requested=%d",
-             (p - lp) / seconds,
+    PTMC_LOG(@"present=%.2f fps drawable=%llux%llu pixelFormat=%lld displaySync=%lld framebufferOnly=%lld captured=%llu capture=%.2f fps encoded=%.2f fps dropped_pool=%llu dropped_encoder=%llu dropped_late=%llu unsupported=%llu sampling_skips=%llu (%.2f/s) codec=%@ resolution=%@ suppressDisplay=%d skipPresent=%d requested=%d",
+             presentPerSecond,
              (unsigned long long)atomic_load(&_drawableWidth), (unsigned long long)atomic_load(&_drawableHeight),
              (long long)atomic_load(&_pixelFormat), (long long)atomic_load(&_displaySync), (long long)atomic_load(&_framebufferOnly),
-             (unsigned long long)atomic_load(&_captured), (e - le) / seconds,
+             (unsigned long long)c, capturePerSecond, encodedPerSecond,
              (unsigned long long)atomic_load(&_droppedPool), (unsigned long long)atomic_load(&_droppedEncoder),
              (unsigned long long)atomic_load(&_droppedLate), (unsigned long long)atomic_load(&_droppedUnsupported),
              (unsigned long long)samplingSkipped, skipPerSecond, self.codecName ?: @"hevc",

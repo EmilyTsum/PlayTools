@@ -67,3 +67,7 @@ grep -q '_pendingWrites' "$INC"
 grep -q 'io.playcover.ptmc.writer' "$INC"
 grep -q 'samplingSkipPerSecond' "$INC"
 grep -q 'Deadline-based sampling' "$INC"
+
+grep -q 'presentFPS' "$INC"
+grep -q 'captureFPS' "$INC"
+grep -q 'encodedFPS' "$INC"
