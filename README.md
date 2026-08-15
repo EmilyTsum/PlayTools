@@ -178,3 +178,30 @@ Localizations for PlayTools are tricky. As PlayTools runs as a dynamic library i
 
 To avoid conflicting with the game's own localizable strings, PlayTools' localizable strings are renamed to `PlayTools.strings`, instead of the default `Localizable.strings`.
 
+
+## Pre-compositor Metal capture fork
+
+This fork carries an experimental PlayTools Metal Capture (PTMC) path for PlayCover's current GitHub nightly/develop builds. It hooks the game's Metal presentation path before WindowServer composition, performs GPU BGRA→NV12 conversion into an IOSurface-backed fixed ring, and sends frames to VideoToolbox HEVC without full-frame CPU readback.
+
+Build and package on macOS:
+
+```sh
+./scripts/ptmc_build_on_mac.sh
+```
+
+Install into an existing PlayCover nightly with backup/rollback support:
+
+```sh
+./scripts/ptmc_install_into_playcover.sh
+```
+
+Capture control:
+
+```sh
+PTMC_FPS=120 PTMC_BITRATE=120000000 ./scripts/ptmc_enable_capture_env.sh
+./scripts/ptmc_control_capture.sh status
+./scripts/ptmc_control_capture.sh start
+./scripts/ptmc_control_capture.sh stop
+```
+
+Optional frame-pacing probes are `PTMC_DISABLE_DISPLAY_SYNC=1` and `PTMC_SPOOF_MAX_FPS=120`. See `docs/PTMC/`.

@@ -390,6 +390,8 @@ DYLD_INTERPOSE(pt_rename, rename)
 DYLD_INTERPOSE(pt_unlink, unlink)
 DYLD_INTERPOSE(pt_usleep, usleep)
 
+#include "MetalCapture/PTMetalCapture.inc"
+
 @implementation PlayLoader
 
 static void __attribute__((constructor)) initialize(void) {
