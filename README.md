@@ -206,4 +206,4 @@ PTMC_FPS=120 PTMC_BITRATE=120000000 PTMC_OUTPUT_DIR="$HOME/Movies" ./scripts/ptm
 
 `PTMC_OUTPUT` selects one exact file path; `PTMC_OUTPUT_DIR` instead creates a fresh timestamped `.mov` for each recording. The custom `EmilyTsum/PlayCover` `ptmc-nightly` fork exposes these settings per game and sends bundle-targeted start/stop/status notifications, so shell scripts are not required for normal use.
 
-Optional frame-pacing probes are `PTMC_DISABLE_DISPLAY_SYNC=1` and `PTMC_SPOOF_MAX_FPS=120`. See `docs/PTMC/`.
+Optional frame-pacing probes are `PTMC_DISABLE_DISPLAY_SYNC=1` and `PTMC_SPOOF_MAX_FPS=120`. Maintainers should read `docs/PTMC/README.md`; the exact cross-repository pin and release state live in the PlayCover fork's `PTMC_INTEGRATION.md`.
