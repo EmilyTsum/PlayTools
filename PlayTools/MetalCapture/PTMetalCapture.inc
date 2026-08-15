@@ -242,7 +242,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) BOOL forceSDRDisplay;
 @property(nonatomic) BOOL captureEnabled;
 @property(atomic, copy) NSString *colorSpaceName;
-@property(nonatomic, strong) dispatch_source_t heartbeatTimer;
+@property(nonatomic) dispatch_source_t heartbeatTimer;
 @property(nonatomic, copy) NSString *statusPath;
 - (void)reloadConfiguration;
 - (void)start;
@@ -1124,7 +1124,7 @@ static void ptmc_observe_and_normalize_layer(CAMetalLayer *layer, PTMCManager *m
     CGColorSpaceRef current = layer.colorspace;
     manager.colorSpaceName = ptmc_colorspace_name(current);
     CGColorSpaceRef sRGB = ptmc_srgb_colorspace();
-    if (forceSDR && sRGB && (!current || !CGColorSpaceEqualToColorSpace(current, sRGB))) {
+    if (forceSDR && sRGB && (!current || !CFEqual(current, sRGB))) {
         layer.colorspace = sRGB;
         manager.colorSpaceName = ptmc_colorspace_name(sRGB);
     }
