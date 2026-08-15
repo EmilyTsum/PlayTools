@@ -282,6 +282,9 @@ static NSString *ptmc_output_path_from_environment(void) {
     float _originalOpacity;
     BOOL _hasOriginalEDR;
     BOOL _hasOriginalDisplaySync;
+    BOOL _hasDeveloperHUDProperties;
+    atomic_bool _metalHUDSuppressed;
+    NSDictionary *_originalHUDProperties;
     CGColorSpaceRef _originalColorSpace;
 }
 @property(atomic, strong) PTMCSession *session;
@@ -295,6 +298,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) BOOL forceSDRDisplay;
 @property(nonatomic) BOOL suppressDisplayOutput;
 @property(nonatomic) BOOL skipDisplayPresent;
+@property(nonatomic) BOOL includeMetalHUDInCapture;
 @property(nonatomic, copy) NSString *captureResolutionMode;
 @property(nonatomic) NSInteger captureWidth;
 @property(nonatomic) NSInteger captureHeight;
@@ -366,6 +370,8 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
         status[@"captureEnabled"] = @(manager.captureEnabled);
         status[@"displaySuppressed"] = @(manager.suppressDisplayOutput);
         status[@"displayPresentSkipped"] = @(manager.skipDisplayPresent);
+        status[@"includeMetalHUDInCapture"] = @(manager.includeMetalHUDInCapture);
+        status[@"metalHUDSuppressed"] = @(atomic_load_explicit(&manager->_metalHUDSuppressed, memory_order_relaxed));
         status[@"skippedPresents"] = @(atomic_load_explicit(&manager->_skippedPresents, memory_order_relaxed));
         status[@"ownedCaptureCommandBuffers"] = @(atomic_load_explicit(&manager->_ownedCaptureCommandBuffers, memory_order_relaxed));
         status[@"lastOwnedCaptureGPUTimeUs"] = @(atomic_load_explicit(&manager->_lastOwnedCaptureGPUTimeUs, memory_order_relaxed));
@@ -927,6 +933,9 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_lastOwnedCaptureCompletionUs, 0);
         atomic_init(&_layerNeedsRefresh, true);
         _originalColorSpace = NULL;
+        _originalHUDProperties = nil;
+        _hasDeveloperHUDProperties = NO;
+        atomic_init(&_metalHUDSuppressed, false);
         [self reloadConfiguration];
     }
     return self;
@@ -943,6 +952,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     BOOL configForceSDR = [config[@"forceSDRDisplay"] respondsToSelector:@selector(boolValue)] ? [config[@"forceSDRDisplay"] boolValue] : YES;
     BOOL configSuppressDisplay = [config[@"suppressDisplayOutput"] respondsToSelector:@selector(boolValue)] ? [config[@"suppressDisplayOutput"] boolValue] : NO;
     BOOL configSkipDisplayPresent = [config[@"skipDisplayPresent"] respondsToSelector:@selector(boolValue)] ? [config[@"skipDisplayPresent"] boolValue] : NO;
+    BOOL configIncludeMetalHUD = [config[@"includeMetalHUDInCapture"] respondsToSelector:@selector(boolValue)] ? [config[@"includeMetalHUDInCapture"] boolValue] : NO;
     NSString *configResolution = [config[@"resolutionMode"] isKindOfClass:[NSString class]] ? [config[@"resolutionMode"] lowercaseString] : @"source";
     long long configCaptureWidth = [config[@"captureWidth"] respondsToSelector:@selector(longLongValue)] ? [config[@"captureWidth"] longLongValue] : 1920;
     long long configCaptureHeight = [config[@"captureHeight"] respondsToSelector:@selector(longLongValue)] ? [config[@"captureHeight"] longLongValue] : 1080;
@@ -958,6 +968,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     self.forceSDRDisplay = ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", configForceSDR);
     self.suppressDisplayOutput = ptmc_env_bool("PTMC_SUPPRESS_DISPLAY", configSuppressDisplay);
     self.skipDisplayPresent = ptmc_env_bool("PTMC_SKIP_DISPLAY_PRESENT", configSkipDisplayPresent);
+    self.includeMetalHUDInCapture = ptmc_env_bool("PTMC_CAPTURE_METAL_HUD", configIncludeMetalHUD);
     NSString *resolutionMode = [ptmc_env_string("PTMC_RESOLUTION_MODE", configResolution) lowercaseString];
     NSSet *allowedResolutions = [NSSet setWithArray:@[@"source", @"2160p", @"1440p", @"1080p", @"720p", @"custom"]];
     if (![allowedResolutions containsObject:resolutionMode]) resolutionMode = @"source";
@@ -987,7 +998,13 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 
 - (void)start {
     [self reloadConfiguration];
-    atomic_store_explicit(&_requested, true, memory_order_release);
+    if (atomic_exchange_explicit(&_requested, true, memory_order_acq_rel)) {
+        atomic_store_explicit(&_layerNeedsRefresh, true, memory_order_release);
+        PTMC_LOG(@"start requested while already recording; keeping active session");
+        ptmc_publish_status(self, self.session, self.session ? @"recording" : @"requested",
+                            @"Capture already active; runtime settings refresh queued");
+        return;
+    }
     atomic_store_explicit(&_presented, 0, memory_order_relaxed);
     atomic_store_explicit(&_captured, 0, memory_order_relaxed);
     atomic_store_explicit(&_encoded, 0, memory_order_relaxed);
@@ -1064,6 +1081,8 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         s.captureIntervalTicks = ptmc_ns_to_ticks(1000000000ull / (uint64_t)MAX(s.fps, 1));
         s.bitrate = self.bitrate; s.codecName = self.codecName; s.bufferCount = self.bufferCount;
         s.device = device;
+        // Allocate the direct-drawable capture queue off the present thread.
+        s.commandQueue = [device newCommandQueue];
         dispatch_queue_attr_t encoderAttr = dispatch_queue_attr_make_with_qos_class(
             DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
         dispatch_queue_attr_t writerAttr = dispatch_queue_attr_make_with_qos_class(
@@ -1483,6 +1502,37 @@ static void ptmc_release_original_colorspace(PTMCManager *manager) {
     }
 }
 
+static NSDictionary *ptmc_get_developer_hud_properties(CAMetalLayer *layer) {
+    SEL getter = NSSelectorFromString(@"developerHUDProperties");
+    if (![layer respondsToSelector:getter]) return nil;
+    id value = ((id (*)(id, SEL))objc_msgSend)(layer, getter);
+    return [value isKindOfClass:[NSDictionary class]] ? [value copy] : nil;
+}
+
+static void ptmc_call_original_hud_properties_setter(CAMetalLayer *layer, NSDictionary *properties) {
+    SEL setter = NSSelectorFromString(@"setDeveloperHUDProperties:");
+    IMP original = ptmc_original_imp(layer, setter);
+    if (original) ((void (*)(id, SEL, id))original)(layer, setter, properties);
+    else if ([layer respondsToSelector:setter]) ((void (*)(id, SEL, id))objc_msgSend)(layer, setter, properties);
+}
+
+static void ptmc_apply_hud_capture_policy(CAMetalLayer *layer, PTMCManager *manager) {
+    if (!manager->_hasDeveloperHUDProperties) return;
+    if (manager.includeMetalHUDInCapture) {
+        if (atomic_load_explicit(&manager->_metalHUDSuppressed, memory_order_acquire)) {
+            ptmc_call_original_hud_properties_setter(layer, manager->_originalHUDProperties);
+            atomic_store_explicit(&manager->_metalHUDSuppressed, false, memory_order_release);
+        }
+        return;
+    }
+    NSMutableDictionary *properties = manager->_originalHUDProperties
+        ? [manager->_originalHUDProperties mutableCopy]
+        : [NSMutableDictionary dictionary];
+    properties[@"mode"] = @"disabled";
+    ptmc_call_original_hud_properties_setter(layer, properties);
+    atomic_store_explicit(&manager->_metalHUDSuppressed, true, memory_order_release);
+}
+
 static void ptmc_restore_capture_layer(PTMCManager *manager) {
     CAMetalLayer *layer = manager.captureLayer;
     if (!layer) {
@@ -1500,6 +1550,10 @@ static void ptmc_restore_capture_layer(PTMCManager *manager) {
         ptmc_call_original_bool_setter(layer, edrSetter, manager->_originalEDR);
     }
     ptmc_call_original_colorspace_setter(layer, manager->_originalColorSpace);
+    if (manager->_hasDeveloperHUDProperties) {
+        ptmc_call_original_hud_properties_setter(layer, manager->_originalHUDProperties);
+    }
+    atomic_store_explicit(&manager->_metalHUDSuppressed, false, memory_order_release);
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     layer.opacity = manager->_originalOpacity;
@@ -1508,6 +1562,8 @@ static void ptmc_restore_capture_layer(PTMCManager *manager) {
     manager.captureLayer = nil;
     manager->_hasOriginalEDR = NO;
     manager->_hasOriginalDisplaySync = NO;
+    manager->_hasDeveloperHUDProperties = NO;
+    manager->_originalHUDProperties = nil;
     ptmc_release_original_colorspace(manager);
     atomic_store_explicit(&manager->_layerNeedsRefresh, true, memory_order_release);
 }
@@ -1540,8 +1596,17 @@ static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager
         }
         CGColorSpaceRef original = layer.colorspace;
         if (original) manager->_originalColorSpace = CGColorSpaceRetain(original);
+        SEL hudGetter = NSSelectorFromString(@"developerHUDProperties");
+        SEL hudSetter = NSSelectorFromString(@"setDeveloperHUDProperties:");
+        manager->_hasDeveloperHUDProperties = [layer respondsToSelector:hudGetter] &&
+                                               [layer respondsToSelector:hudSetter];
+        manager->_originalHUDProperties = manager->_hasDeveloperHUDProperties
+            ? ptmc_get_developer_hud_properties(layer)
+            : nil;
+        atomic_store_explicit(&manager->_metalHUDSuppressed, false, memory_order_release);
         manager.captureLayer = layer;
     }
+    ptmc_apply_hud_capture_policy(layer, manager);
 
     if (layer.framebufferOnly) layer.framebufferOnly = NO;
     atomic_store_explicit(&manager->_framebufferOnly, layer.framebufferOnly ? 1 : 0, memory_order_relaxed);
@@ -1759,6 +1824,7 @@ static BOOL ptmc_class_is_subclass_of(Class cls, Class base) {
 }
 
 static void ptmc_set_wants_edr(id self, SEL _cmd, BOOL wantsEDR);
+static void ptmc_set_developer_hud_properties(id self, SEL _cmd, NSDictionary *properties);
 static void ptmc_set_colorspace(id self, SEL _cmd, CGColorSpaceRef colorSpace);
 static void ptmc_set_framebuffer_only(id self, SEL _cmd, BOOL framebufferOnly);
 
@@ -1784,6 +1850,7 @@ static void ptmc_discover_runtime_classes(void) {
     SEL setEDR = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
     SEL setColorSpace = @selector(setColorspace:);
     SEL setFramebufferOnly = @selector(setFramebufferOnly:);
+    SEL setDeveloperHUDProperties = NSSelectorFromString(@"setDeveloperHUDProperties:");
     unsigned installed = 0;
     unsigned drawableInstalled = 0;
 
@@ -1806,6 +1873,8 @@ static void ptmc_discover_runtime_classes(void) {
             installed += ptmc_install_owner_hook(cls, setEDR, (IMP)ptmc_set_wants_edr);
             installed += ptmc_install_owner_hook(cls, setColorSpace, (IMP)ptmc_set_colorspace);
             installed += ptmc_install_owner_hook(cls, setFramebufferOnly, (IMP)ptmc_set_framebuffer_only);
+            installed += ptmc_install_owner_hook(cls, setDeveloperHUDProperties,
+                                                 (IMP)ptmc_set_developer_hud_properties);
         }
     }
 
@@ -1899,6 +1968,22 @@ static void ptmc_set_framebuffer_only(id self, SEL _cmd, BOOL framebufferOnly) {
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, BOOL))original)(self, _cmd, effective);
 }
+
+static void ptmc_set_developer_hud_properties(id self, SEL _cmd, NSDictionary *properties) {
+    BOOL recording = atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire);
+    PTMCManager *manager = recording ? ptmc_manager() : nil;
+    NSDictionary *effective = properties;
+    if (manager && manager.captureLayer == self && !manager.includeMetalHUDInCapture) {
+        manager->_originalHUDProperties = [properties copy];
+        NSMutableDictionary *hidden = properties ? [properties mutableCopy] : [NSMutableDictionary dictionary];
+        hidden[@"mode"] = @"disabled";
+        effective = hidden;
+        atomic_store_explicit(&manager->_metalHUDSuppressed, true, memory_order_release);
+    }
+    IMP original = ptmc_original_imp(self, _cmd);
+    if (original) ((void (*)(id, SEL, id))original)(self, _cmd, effective);
+}
+
 static NSInteger ptmc_maximum_frames_per_second(id self, SEL _cmd) {
     if (ptmc_spoof_max_fps > 0) return ptmc_spoof_max_fps;
     return ptmc_max_fps_original ? ((NSInteger (*)(id, SEL))ptmc_max_fps_original)(self, _cmd) : 60;
@@ -1965,10 +2050,11 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
         CFNotificationCenterAddObserver(darwin, NULL, ptmc_control_notification, ptmc_target_status_notification, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     }
     _dyld_register_func_for_add_image(ptmc_image_added);
-    PTMC_LOG(@"runtime ready bundle=%@ codec=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d forceSDR=%d spoofMaxFPS=%ld enabled=%d",
+    PTMC_LOG(@"runtime ready bundle=%@ codec=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d forceSDR=%d captureHUD=%d spoofMaxFPS=%ld enabled=%d",
              bundleIdentifier ?: @"(unknown)", manager.codecName ?: @"hevc",
              (long)manager.fps, (long)manager.bitrate, (long)manager.bufferCount,
-             manager.disableDisplaySync, manager.forceSDRDisplay, (long)ptmc_spoof_max_fps, enabled);
+             manager.disableDisplaySync, manager.forceSDRDisplay, manager.includeMetalHUDInCapture,
+             (long)ptmc_spoof_max_fps, enabled);
     ptmc_publish_status(manager, nil, @"ready", @"PTMC runtime loaded; frame hooks are dormant until Start");
     manager.heartbeatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
