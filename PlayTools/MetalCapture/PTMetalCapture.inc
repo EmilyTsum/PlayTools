@@ -255,6 +255,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) BOOL forceSDRDisplay;
 @property(nonatomic) BOOL captureEnabled;
 @property(atomic, copy) NSString *colorSpaceName;
+@property(atomic, strong) CAMetalLayer *captureLayer;
 @property(nonatomic) dispatch_source_t heartbeatTimer;
 @property(nonatomic, copy) NSString *statusPath;
 - (void)reloadConfiguration;
@@ -269,6 +270,7 @@ static PTMCManager *ptmc_manager(void);
 static void ptmc_discover_runtime_classes(void);
 static void ptmc_schedule_discovery(void);
 static void ptmc_update_max_fps_hook(void);
+static void ptmc_uninstall_runtime_hooks(void);
 static NSInteger ptmc_spoof_max_fps = 0;
 static atomic_bool ptmc_recording_fast = false;
 
@@ -718,6 +720,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         codec = @"hevc";
     }
     self.codecName = codec;
+    self.captureLayer = nil;
 
     const char *statusFile = getenv("PTMC_STATUS_FILE");
     if (statusFile && *statusFile) {
@@ -731,6 +734,15 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 - (void)start {
     [self reloadConfiguration];
     atomic_store_explicit(&_requested, true, memory_order_release);
+    atomic_store_explicit(&_presented, 0, memory_order_relaxed);
+    atomic_store_explicit(&_captured, 0, memory_order_relaxed);
+    atomic_store_explicit(&_encoded, 0, memory_order_relaxed);
+    atomic_store_explicit(&_droppedPool, 0, memory_order_relaxed);
+    atomic_store_explicit(&_droppedEncoder, 0, memory_order_relaxed);
+    atomic_store_explicit(&_droppedLate, 0, memory_order_relaxed);
+    atomic_store_explicit(&_droppedUnsupported, 0, memory_order_relaxed);
+    atomic_store_explicit(&_skippedRate, 0, memory_order_relaxed);
+    self.captureLayer = nil;
     atomic_store_explicit(&ptmc_recording_fast, true, memory_order_release);
     ptmc_update_max_fps_hook();
     // Install expensive frame-path hooks only when recording is actually requested. Games that
@@ -744,6 +756,8 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 - (void)stop {
     atomic_store_explicit(&_requested, false, memory_order_release);
     atomic_store_explicit(&ptmc_recording_fast, false, memory_order_release);
+    self.captureLayer = nil;
+    ptmc_uninstall_runtime_hooks();
     ptmc_spoof_max_fps = 0;
     ptmc_update_max_fps_hook();
     PTMCSession *session = self.session;
@@ -811,6 +825,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     }
     if ([texture respondsToSelector:@selector(framebufferOnly)] && texture.framebufferOnly) {
         atomic_fetch_add_explicit(&_droppedUnsupported, 1, memory_order_relaxed);
+        self.captureLayer = nil;
         return;
     }
     BOOL sourceSRGB = texture.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB;
@@ -982,10 +997,13 @@ typedef struct {
     __unsafe_unretained Class cls;
     SEL selector;
     IMP original;
+    IMP replacement;
 } PTMCHookEntry;
 
 static PTMCHookEntry ptmc_hooks[PTMC_MAX_HOOKS];
 static atomic_uint ptmc_hook_count;
+static atomic_uint ptmc_imp_generation;
+static atomic_bool ptmc_drawable_path_active;
 static os_unfair_lock ptmc_hook_lock = OS_UNFAIR_LOCK_INIT;
 static atomic_bool ptmc_discovery_scheduled;
 static atomic_bool ptmc_image_scan_pending;
@@ -995,6 +1013,7 @@ typedef struct {
     __unsafe_unretained Class cls;
     SEL selector;
     IMP original;
+    unsigned generation;
 } PTMCImpCacheEntry;
 
 static _Thread_local PTMCImpCacheEntry ptmc_imp_cache[8];
@@ -1002,8 +1021,10 @@ static _Thread_local PTMCImpCacheEntry ptmc_imp_cache[8];
 static IMP ptmc_original_imp(id self, SEL selector) {
     Class runtimeClass = object_getClass(self);
     uintptr_t hash = (((uintptr_t)runtimeClass >> 4) ^ ((uintptr_t)selector >> 4)) & 7u;
+    unsigned generation = atomic_load_explicit(&ptmc_imp_generation, memory_order_acquire);
     PTMCImpCacheEntry cached = ptmc_imp_cache[hash];
-    if (cached.cls == runtimeClass && cached.selector == selector && cached.original) return cached.original;
+    if (cached.generation == generation && cached.cls == runtimeClass &&
+        cached.selector == selector && cached.original) return cached.original;
 
     unsigned count = atomic_load_explicit(&ptmc_hook_count, memory_order_acquire);
     IMP original = NULL;
@@ -1015,7 +1036,9 @@ static IMP ptmc_original_imp(id self, SEL selector) {
             }
         }
     }
-    ptmc_imp_cache[hash] = (PTMCImpCacheEntry){ .cls = runtimeClass, .selector = selector, .original = original };
+    ptmc_imp_cache[hash] = (PTMCImpCacheEntry){
+        .cls = runtimeClass, .selector = selector, .original = original, .generation = generation
+    };
     return original;
 }
 
@@ -1034,9 +1057,46 @@ static BOOL ptmc_class_implements_selector(Class cls, SEL selector, Method *meth
     return found;
 }
 
+static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager) {
+    if (!layer || manager.captureLayer == layer) return;
+    if (layer.framebufferOnly) layer.framebufferOnly = NO;
+    atomic_store_explicit(&manager->_framebufferOnly, layer.framebufferOnly ? 1 : 0, memory_order_relaxed);
+
+    SEL syncGetter = NSSelectorFromString(@"displaySyncEnabled");
+    SEL syncSetter = NSSelectorFromString(@"setDisplaySyncEnabled:");
+    if ([layer respondsToSelector:syncGetter]) {
+        BOOL sync = ((BOOL (*)(id, SEL))objc_msgSend)(layer, syncGetter);
+        if (manager.disableDisplaySync && sync && [layer respondsToSelector:syncSetter]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, syncSetter, NO);
+            sync = NO;
+        }
+        atomic_store_explicit(&manager->_displaySync, sync ? 1 : 0, memory_order_relaxed);
+    }
+
+    if (manager.forceSDRDisplay) {
+        SEL edrGetter = NSSelectorFromString(@"wantsExtendedDynamicRangeContent");
+        SEL edrSetter = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
+        if ([layer respondsToSelector:edrGetter]) {
+            BOOL edr = ((BOOL (*)(id, SEL))objc_msgSend)(layer, edrGetter);
+            if (edr && [layer respondsToSelector:edrSetter]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, edrSetter, NO);
+                edr = NO;
+            }
+            atomic_store_explicit(&manager->_edr, edr ? 1 : 0, memory_order_relaxed);
+        }
+        CGColorSpaceRef sRGB = ptmc_srgb_colorspace();
+        CGColorSpaceRef current = layer.colorspace;
+        if (sRGB && (!current || !CFEqual(current, sRGB))) layer.colorspace = sRGB;
+    }
+    manager.colorSpaceName = ptmc_colorspace_name(layer.colorspace);
+    manager.captureLayer = layer;
+}
+
 static void ptmc_record_present(id commandBuffer, id<CAMetalDrawable> drawable) {
     if (!atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire)) return;
     PTMCManager *manager = ptmc_manager();
+    CAMetalLayer *layer = [drawable respondsToSelector:@selector(layer)] ? drawable.layer : nil;
+    ptmc_prepare_capture_layer(layer, manager);
     uint64_t tick = mach_continuous_time();
     atomic_fetch_add_explicit(&manager->_presented, 1, memory_order_relaxed);
     id<MTLTexture> texture = drawable.texture;
@@ -1048,23 +1108,22 @@ static void ptmc_record_present(id commandBuffer, id<CAMetalDrawable> drawable) 
             [manager captureTexture:texture commandBuffer:(id<MTLCommandBuffer>)commandBuffer tick:tick];
         }
     }
-    [manager logStatusForce:NO tick:tick];
 }
 
 static void ptmc_present_drawable(id self, SEL _cmd, id<CAMetalDrawable> drawable) {
-    ptmc_record_present(self, drawable);
+    if (!atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)) ptmc_record_present(self, drawable);
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id<CAMetalDrawable>))original)(self, _cmd, drawable);
 }
 
 static void ptmc_present_drawable_at_time(id self, SEL _cmd, id<CAMetalDrawable> drawable, CFTimeInterval time) {
-    ptmc_record_present(self, drawable);
+    if (!atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)) ptmc_record_present(self, drawable);
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id<CAMetalDrawable>, CFTimeInterval))original)(self, _cmd, drawable, time);
 }
 
 static void ptmc_present_drawable_after_duration(id self, SEL _cmd, id<CAMetalDrawable> drawable, CFTimeInterval duration) {
-    ptmc_record_present(self, drawable);
+    if (!atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)) ptmc_record_present(self, drawable);
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id<CAMetalDrawable>, CFTimeInterval))original)(self, _cmd, drawable, duration);
 }
@@ -1096,27 +1155,60 @@ static void ptmc_drawable_present_with_options(id self, SEL _cmd, id options) {
 static BOOL ptmc_install_one_hook(Class cls, SEL selector, IMP replacement) {
     Method ownMethod = NULL;
     if (!ptmc_class_implements_selector(cls, selector, &ownMethod) || !ownMethod) return NO;
-    IMP original = method_getImplementation(ownMethod);
-    if (!original || original == replacement) return NO;
 
     os_unfair_lock_lock(&ptmc_hook_lock);
     unsigned count = atomic_load_explicit(&ptmc_hook_count, memory_order_relaxed);
     for (unsigned i = 0; i < count; i++) {
-        if (ptmc_hooks[i].cls == cls && ptmc_hooks[i].selector == selector) {
+        if (ptmc_hooks[i].cls != cls || ptmc_hooks[i].selector != selector) continue;
+        IMP current = method_getImplementation(ownMethod);
+        if (current == replacement) {
             os_unfair_lock_unlock(&ptmc_hook_lock);
             return NO;
         }
-    }
-    if (count >= PTMC_MAX_HOOKS) {
+        // If somebody legitimately changed this method while PTMC was dormant, chain to their
+        // current implementation instead of restoring a stale IMP.
+        ptmc_hooks[i].original = current;
+        ptmc_hooks[i].replacement = replacement;
+        method_setImplementation(ownMethod, replacement);
+        atomic_fetch_add_explicit(&ptmc_imp_generation, 1, memory_order_release);
         os_unfair_lock_unlock(&ptmc_hook_lock);
-        PTMC_LOG(@"hook table full");
+        return YES;
+    }
+
+    IMP original = method_getImplementation(ownMethod);
+    if (!original || original == replacement || count >= PTMC_MAX_HOOKS) {
+        if (count >= PTMC_MAX_HOOKS) PTMC_LOG(@"hook table full");
+        os_unfair_lock_unlock(&ptmc_hook_lock);
         return NO;
     }
-    ptmc_hooks[count] = (PTMCHookEntry){ .cls = cls, .selector = selector, .original = original };
+    ptmc_hooks[count] = (PTMCHookEntry){
+        .cls = cls, .selector = selector, .original = original, .replacement = replacement
+    };
     atomic_store_explicit(&ptmc_hook_count, count + 1, memory_order_release);
     method_setImplementation(ownMethod, replacement);
+    atomic_fetch_add_explicit(&ptmc_imp_generation, 1, memory_order_release);
     os_unfair_lock_unlock(&ptmc_hook_lock);
     return YES;
+}
+
+static void ptmc_uninstall_runtime_hooks(void) {
+    os_unfair_lock_lock(&ptmc_hook_lock);
+    unsigned count = atomic_load_explicit(&ptmc_hook_count, memory_order_acquire);
+    unsigned restored = 0;
+    for (unsigned i = 0; i < count; i++) {
+        PTMCHookEntry entry = ptmc_hooks[i];
+        Method ownMethod = NULL;
+        if (!entry.cls || !ptmc_class_implements_selector(entry.cls, entry.selector, &ownMethod) || !ownMethod) continue;
+        if (method_getImplementation(ownMethod) == entry.replacement) {
+            method_setImplementation(ownMethod, entry.original);
+            restored++;
+        }
+    }
+    atomic_fetch_add_explicit(&ptmc_imp_generation, 1, memory_order_release);
+    atomic_store_explicit(&ptmc_drawable_path_active, false, memory_order_release);
+    atomic_store_explicit(&ptmc_manager()->_presentHookCount, 0, memory_order_relaxed);
+    os_unfair_lock_unlock(&ptmc_hook_lock);
+    if (restored) PTMC_LOG(@"restored %u Metal methods; idle path returned to native dispatch", restored);
 }
 
 static Class ptmc_method_owner(Class cls, SEL selector) {
@@ -1138,9 +1230,9 @@ static BOOL ptmc_class_is_subclass_of(Class cls, Class base) {
     return NO;
 }
 
-static id<CAMetalDrawable> ptmc_next_drawable(CAMetalLayer *self, SEL _cmd);
 static void ptmc_set_wants_edr(id self, SEL _cmd, BOOL wantsEDR);
 static void ptmc_set_colorspace(id self, SEL _cmd, CGColorSpaceRef colorSpace);
+static void ptmc_set_framebuffer_only(id self, SEL _cmd, BOOL framebufferOnly);
 
 static void ptmc_discover_runtime_classes(void) {
     int count = objc_getClassList(NULL, 0);
@@ -1148,80 +1240,81 @@ static void ptmc_discover_runtime_classes(void) {
     __unsafe_unretained Class *classes = (__unsafe_unretained Class *)calloc((size_t)count, sizeof(Class));
     if (!classes) return;
     count = objc_getClassList(classes, count);
-    Protocol *protocol = @protocol(MTLCommandBuffer);
+
     Protocol *drawableProtocol = @protocol(MTLDrawable);
-    Class metalLayerClass = [CAMetalLayer class];
+    Protocol *commandBufferProtocol = @protocol(MTLCommandBuffer);
     Class metalDrawableClass = NSClassFromString(@"CAMetalDrawable");
     Class baseCmdBufferClass = NSClassFromString(@"_MTLCommandBuffer");
-    unsigned installed = 0;
-    SEL s1 = @selector(presentDrawable:);
-    SEL s2 = @selector(presentDrawable:atTime:);
-    SEL s3 = @selector(presentDrawable:afterMinimumDuration:);
+    Class metalLayerClass = [CAMetalLayer class];
     SEL d1 = @selector(present);
     SEL d2 = @selector(presentAtTime:);
     SEL d3 = @selector(presentAfterMinimumDuration:);
     SEL d4 = NSSelectorFromString(@"presentWithOptions:");
-    SEL next = @selector(nextDrawable);
+    SEL s1 = @selector(presentDrawable:);
+    SEL s2 = @selector(presentDrawable:atTime:);
+    SEL s3 = @selector(presentDrawable:afterMinimumDuration:);
     SEL setEDR = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
     SEL setColorSpace = @selector(setColorspace:);
-
-    if (baseCmdBufferClass) {
-        unsigned presentInstalled = 0;
-        presentInstalled += ptmc_install_owner_hook(baseCmdBufferClass, s1, (IMP)ptmc_present_drawable);
-        presentInstalled += ptmc_install_owner_hook(baseCmdBufferClass, s2, (IMP)ptmc_present_drawable_at_time);
-        presentInstalled += ptmc_install_owner_hook(baseCmdBufferClass, s3, (IMP)ptmc_present_drawable_after_duration);
-        if (presentInstalled) {
-            atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, presentInstalled, memory_order_relaxed);
-            PTMC_LOG(@"base command-buffer hooks class=%@ installed=%u", NSStringFromClass(baseCmdBufferClass), presentInstalled);
-            installed += presentInstalled;
-        }
-    }
+    SEL setFramebufferOnly = @selector(setFramebufferOnly:);
+    unsigned installed = 0;
+    unsigned drawableInstalled = 0;
 
     if (metalDrawableClass) {
-        unsigned drawableInstalled = 0;
         drawableInstalled += ptmc_install_owner_hook(metalDrawableClass, d1, (IMP)ptmc_drawable_present);
         drawableInstalled += ptmc_install_owner_hook(metalDrawableClass, d2, (IMP)ptmc_drawable_present_at_time);
         drawableInstalled += ptmc_install_owner_hook(metalDrawableClass, d3, (IMP)ptmc_drawable_present_after_duration);
         drawableInstalled += ptmc_install_owner_hook(metalDrawableClass, d4, (IMP)ptmc_drawable_present_with_options);
-        if (drawableInstalled) {
-            atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, drawableInstalled, memory_order_relaxed);
-            PTMC_LOG(@"base drawable hooks class=%@ installed=%u", NSStringFromClass(metalDrawableClass), drawableInstalled);
-            installed += drawableInstalled;
-        }
     }
-
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
-        if (class_conformsToProtocol(cls, protocol) || (baseCmdBufferClass && ptmc_class_is_subclass_of(cls, baseCmdBufferClass))) {
-            unsigned presentInstalled = 0;
-            presentInstalled += ptmc_install_owner_hook(cls, s1, (IMP)ptmc_present_drawable);
-            presentInstalled += ptmc_install_owner_hook(cls, s2, (IMP)ptmc_present_drawable_at_time);
-            presentInstalled += ptmc_install_owner_hook(cls, s3, (IMP)ptmc_present_drawable_after_duration);
-            if (presentInstalled) {
-                atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, presentInstalled, memory_order_relaxed);
-                PTMC_LOG(@"command-buffer hooks class=%@ installed=%u", NSStringFromClass(cls), presentInstalled);
-                installed += presentInstalled;
-            }
-        }
-        if (class_conformsToProtocol(cls, drawableProtocol) || (metalDrawableClass && ptmc_class_is_subclass_of(cls, metalDrawableClass))) {
-            unsigned drawableInstalled = 0;
+        if (class_conformsToProtocol(cls, drawableProtocol) ||
+            (metalDrawableClass && ptmc_class_is_subclass_of(cls, metalDrawableClass))) {
             drawableInstalled += ptmc_install_owner_hook(cls, d1, (IMP)ptmc_drawable_present);
             drawableInstalled += ptmc_install_owner_hook(cls, d2, (IMP)ptmc_drawable_present_at_time);
             drawableInstalled += ptmc_install_owner_hook(cls, d3, (IMP)ptmc_drawable_present_after_duration);
             drawableInstalled += ptmc_install_owner_hook(cls, d4, (IMP)ptmc_drawable_present_with_options);
-            if (drawableInstalled) {
-                atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, drawableInstalled, memory_order_relaxed);
-                installed += drawableInstalled;
-            }
         }
         if (ptmc_class_is_subclass_of(cls, metalLayerClass)) {
-            installed += ptmc_install_owner_hook(cls, next, (IMP)ptmc_next_drawable);
             installed += ptmc_install_owner_hook(cls, setEDR, (IMP)ptmc_set_wants_edr);
             installed += ptmc_install_owner_hook(cls, setColorSpace, (IMP)ptmc_set_colorspace);
+            installed += ptmc_install_owner_hook(cls, setFramebufferOnly, (IMP)ptmc_set_framebuffer_only);
         }
     }
+
+    if (drawableInstalled > 0) {
+        atomic_store_explicit(&ptmc_drawable_path_active, true, memory_order_release);
+        atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, drawableInstalled, memory_order_relaxed);
+        PTMC_LOG(@"direct CAMetalDrawable hooks installed=%u", drawableInstalled);
+        installed += drawableInstalled;
+    }
+
+    // Real-device Unity uses CAMetalDrawable.present* directly. Keep MTLCommandBuffer interception
+    // only as a compatibility fallback so the normal path has fewer swizzled hot methods.
+    if (!atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)) {
+        unsigned commandInstalled = 0;
+        if (baseCmdBufferClass) {
+            commandInstalled += ptmc_install_owner_hook(baseCmdBufferClass, s1, (IMP)ptmc_present_drawable);
+            commandInstalled += ptmc_install_owner_hook(baseCmdBufferClass, s2, (IMP)ptmc_present_drawable_at_time);
+            commandInstalled += ptmc_install_owner_hook(baseCmdBufferClass, s3, (IMP)ptmc_present_drawable_after_duration);
+        }
+        for (int i = 0; i < count; i++) {
+            Class cls = classes[i];
+            if (class_conformsToProtocol(cls, commandBufferProtocol) ||
+                (baseCmdBufferClass && ptmc_class_is_subclass_of(cls, baseCmdBufferClass))) {
+                commandInstalled += ptmc_install_owner_hook(cls, s1, (IMP)ptmc_present_drawable);
+                commandInstalled += ptmc_install_owner_hook(cls, s2, (IMP)ptmc_present_drawable_at_time);
+                commandInstalled += ptmc_install_owner_hook(cls, s3, (IMP)ptmc_present_drawable_after_duration);
+            }
+        }
+        if (commandInstalled) {
+            atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, commandInstalled, memory_order_relaxed);
+            PTMC_LOG(@"command-buffer fallback hooks installed=%u", commandInstalled);
+            installed += commandInstalled;
+        }
+    }
+
     free(classes);
-    if (installed) PTMC_LOG(@"installed %u new Metal hooks (total=%u)", installed, atomic_load(&ptmc_hook_count));
+    if (installed) PTMC_LOG(@"activated %u Metal hooks", installed);
 }
 
 static void ptmc_image_added(const struct mach_header *header, intptr_t slide) {
@@ -1253,54 +1346,6 @@ static BOOL ptmc_should_force_sdr(PTMCManager *manager) {
     return atomic_load_explicit(&manager->_requested, memory_order_acquire) && manager.forceSDRDisplay;
 }
 
-static void ptmc_observe_and_normalize_layer(CAMetalLayer *layer, PTMCManager *manager) {
-    BOOL forceSDR = ptmc_should_force_sdr(manager);
-    if (!forceSDR) return;
-
-    SEL edrGetter = NSSelectorFromString(@"wantsExtendedDynamicRangeContent");
-    SEL edrSetter = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
-
-    if ([layer respondsToSelector:edrGetter]) {
-        BOOL edr = ((BOOL (*)(id, SEL))objc_msgSend)(layer, edrGetter);
-        atomic_store_explicit(&manager->_edr, edr ? 1 : 0, memory_order_relaxed);
-        if (edr && [layer respondsToSelector:edrSetter]) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, edrSetter, NO);
-            atomic_store_explicit(&manager->_edr, 0, memory_order_relaxed);
-        }
-    }
-
-    CGColorSpaceRef sRGB = ptmc_srgb_colorspace();
-    if (sRGB) {
-        CGColorSpaceRef current = layer.colorspace;
-        if (current != sRGB) {
-            if (!current || !CFEqual(current, sRGB)) {
-                layer.colorspace = sRGB;
-            }
-        }
-    }
-}
-
-static id<CAMetalDrawable> ptmc_next_drawable(CAMetalLayer *self, SEL _cmd) {
-    BOOL requested = atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire);
-    if (requested) {
-        PTMCManager *manager = ptmc_manager();
-        ptmc_observe_and_normalize_layer(self, manager);
-        if (self.framebufferOnly) self.framebufferOnly = NO;
-        if (manager.disableDisplaySync) {
-            SEL setter = NSSelectorFromString(@"setDisplaySyncEnabled:");
-            if ([self respondsToSelector:setter]) ((void (*)(id, SEL, BOOL))objc_msgSend)(self, setter, NO);
-        }
-        atomic_store_explicit(&manager->_framebufferOnly, self.framebufferOnly ? 1 : 0, memory_order_relaxed);
-        SEL getter = NSSelectorFromString(@"displaySyncEnabled");
-        if ([self respondsToSelector:getter]) {
-            BOOL sync = ((BOOL (*)(id, SEL))objc_msgSend)(self, getter);
-            atomic_store_explicit(&manager->_displaySync, sync ? 1 : 0, memory_order_relaxed);
-        }
-    }
-    IMP original = ptmc_original_imp(self, _cmd);
-    return original ? ((id<CAMetalDrawable> (*)(id, SEL))original)(self, _cmd) : nil;
-}
-
 static void ptmc_set_wants_edr(id self, SEL _cmd, BOOL wantsEDR) {
     BOOL recording = atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire);
     PTMCManager *manager = recording ? ptmc_manager() : nil;
@@ -1318,6 +1363,13 @@ static void ptmc_set_colorspace(id self, SEL _cmd, CGColorSpaceRef colorSpace) {
     if (manager) manager.colorSpaceName = ptmc_colorspace_name(effective);
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, CGColorSpaceRef))original)(self, _cmd, effective);
+}
+
+static void ptmc_set_framebuffer_only(id self, SEL _cmd, BOOL framebufferOnly) {
+    BOOL recording = atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire);
+    BOOL effective = recording ? NO : framebufferOnly;
+    IMP original = ptmc_original_imp(self, _cmd);
+    if (original) ((void (*)(id, SEL, BOOL))original)(self, _cmd, effective);
 }
 static NSInteger ptmc_maximum_frames_per_second(id self, SEL _cmd) {
     if (ptmc_spoof_max_fps > 0) return ptmc_spoof_max_fps;
@@ -1365,6 +1417,8 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
     BOOL enabled = ptmc_env_bool("PTMC_ENABLE", configEnabled);
     BOOL autostart = ptmc_env_bool("PTMC_AUTOSTART", configAutostart);
     atomic_init(&ptmc_hook_count, 0);
+    atomic_init(&ptmc_imp_generation, 1);
+    atomic_init(&ptmc_drawable_path_active, false);
     atomic_store_explicit(&ptmc_recording_fast, false, memory_order_relaxed);
     atomic_init(&ptmc_discovery_scheduled, false);
     atomic_init(&ptmc_image_scan_pending, false);
@@ -1394,12 +1448,16 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
                               dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
                               NSEC_PER_SEC,
                               100 * NSEC_PER_MSEC);
+    __block unsigned idleHeartbeat = 0;
     dispatch_source_set_event_handler(manager.heartbeatTimer, ^{
         BOOL requested = atomic_load_explicit(&manager->_requested, memory_order_acquire);
-        PTMCSession *session = manager.session;
-        NSString *phase = !requested ? @"ready" : (session ? (session.writer ? @"recording" : @"armed") : @"requested");
-        NSString *message = !requested ? @"PTMC runtime heartbeat" : @"Capture runtime heartbeat";
-        ptmc_publish_status(manager, session, phase, message);
+        if (requested) {
+            [manager logStatusForce:YES tick:mach_continuous_time()];
+            idleHeartbeat = 0;
+        } else if (++idleHeartbeat >= 5) {
+            idleHeartbeat = 0;
+            ptmc_publish_status(manager, nil, @"ready", @"PTMC runtime idle; native Metal dispatch restored");
+        }
     });
     dispatch_resume(manager.heartbeatTimer);
     if (enabled && autostart) [manager start];
