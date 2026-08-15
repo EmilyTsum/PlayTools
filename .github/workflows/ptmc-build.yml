@@ -13,6 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: tests/ptmc_static.sh
+      - run: tests/ptmc_patch_roundtrip.sh
   mac-build:
     runs-on: macos-latest
     steps:
