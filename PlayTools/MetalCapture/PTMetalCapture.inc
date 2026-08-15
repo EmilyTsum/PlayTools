@@ -157,16 +157,19 @@ static NSString *ptmc_output_path_from_environment(void) {
     CVPixelBufferRef pixelBuffer;
     CVMetalTextureRef yTextureRef;
     CVMetalTextureRef uvTextureRef;
+    CVMetalTextureRef bgraTextureRef;
     atomic_bool inUse;
 }
 @property(nonatomic, strong) id<MTLTexture> yTexture;
 @property(nonatomic, strong) id<MTLTexture> uvTexture;
+@property(nonatomic, strong) id<MTLTexture> bgraTexture;
 @end
 
 @implementation PTMCSlot
 - (void)dealloc {
     if (yTextureRef) CFRelease(yTextureRef);
     if (uvTextureRef) CFRelease(uvTextureRef);
+    if (bgraTextureRef) CFRelease(bgraTextureRef);
     if (pixelBuffer) CVPixelBufferRelease(pixelBuffer);
 }
 @end
@@ -539,8 +542,11 @@ static BOOL ptmc_create_video_session(PTMCSession *session) {
             (__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES
         };
     }
+    OSType sourcePixelFormat = ptmc_codec_is_hevc(session.codecName)
+        ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        : kCVPixelFormatType_32BGRA;
     NSDictionary *sourceAttrs = @{
-        (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(sourcePixelFormat),
         (__bridge NSString *)kCVPixelBufferWidthKey: @(session.width),
         (__bridge NSString *)kCVPixelBufferHeightKey: @(session.height),
         (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
@@ -597,8 +603,12 @@ static BOOL ptmc_create_video_session(PTMCSession *session) {
 }
 
 static BOOL ptmc_create_slots(PTMCSession *session) {
+    BOOL hevc = ptmc_codec_is_hevc(session.codecName);
+    OSType pixelFormat = hevc
+        ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        : kCVPixelFormatType_32BGRA;
     NSDictionary *attrs = @{
-        (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(pixelFormat),
         (__bridge NSString *)kCVPixelBufferWidthKey: @(session.width),
         (__bridge NSString *)kCVPixelBufferHeightKey: @(session.height),
         (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
@@ -625,28 +635,44 @@ static BOOL ptmc_create_slots(PTMCSession *session) {
         CVPixelBufferRef pb = NULL;
         rv = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb);
         if (rv != kCVReturnSuccess || !pb) break;
-        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
-        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
-        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                              kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                              kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+                              kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
         PTMCSlot *slot = [[PTMCSlot alloc] init];
         slot->pixelBuffer = pb;
         atomic_init(&slot->inUse, false);
-        rv = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, NULL,
-                                                       MTLPixelFormatR8Unorm, session.width, session.height, 0,
-                                                       &slot->yTextureRef);
-        if (rv != kCVReturnSuccess || !slot->yTextureRef) break;
-        rv = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, NULL,
-                                                       MTLPixelFormatRG8Unorm, session.width / 2, session.height / 2, 1,
-                                                       &slot->uvTextureRef);
-        if (rv != kCVReturnSuccess || !slot->uvTextureRef) break;
-        slot.yTexture = CVMetalTextureGetTexture(slot->yTextureRef);
-        slot.uvTexture = CVMetalTextureGetTexture(slot->uvTextureRef);
-        if (!slot.yTexture || !slot.uvTexture) break;
+        if (hevc) {
+            rv = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, NULL,
+                                                           MTLPixelFormatR8Unorm,
+                                                           session.width, session.height, 0,
+                                                           &slot->yTextureRef);
+            if (rv != kCVReturnSuccess || !slot->yTextureRef) break;
+            rv = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, NULL,
+                                                           MTLPixelFormatRG8Unorm,
+                                                           session.width / 2, session.height / 2, 1,
+                                                           &slot->uvTextureRef);
+            if (rv != kCVReturnSuccess || !slot->uvTextureRef) break;
+            slot.yTexture = CVMetalTextureGetTexture(slot->yTextureRef);
+            slot.uvTexture = CVMetalTextureGetTexture(slot->uvTextureRef);
+            if (!slot.yTexture || !slot.uvTexture) break;
+        } else {
+            rv = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, NULL,
+                                                           MTLPixelFormatBGRA8Unorm,
+                                                           session.width, session.height, 0,
+                                                           &slot->bgraTextureRef);
+            if (rv != kCVReturnSuccess || !slot->bgraTextureRef) break;
+            slot.bgraTexture = CVMetalTextureGetTexture(slot->bgraTextureRef);
+            if (!slot.bgraTexture) break;
+        }
         [slots addObject:slot];
     }
-    CFRelease(pool); // fixed PTMCSlot objects retain the buffers; no per-frame allocation occurs.
+    CFRelease(pool);
     if (slots.count != session.bufferCount) {
-        PTMC_LOG(@"failed to preallocate NV12 ring (%lu/%ld)", (unsigned long)slots.count, (long)session.bufferCount);
+        PTMC_LOG(@"failed to preallocate %@ ring (%lu/%ld)",
+                 hevc ? @"NV12" : @"BGRA", (unsigned long)slots.count, (long)session.bufferCount);
         return NO;
     }
     session.slots = slots;
@@ -654,6 +680,7 @@ static BOOL ptmc_create_slots(PTMCSession *session) {
 }
 
 static BOOL ptmc_create_pipelines(PTMCSession *session) {
+    if (!ptmc_codec_is_hevc(session.codecName)) return YES;
     NSError *error = nil;
     NSString *source = [NSString stringWithUTF8String:ptmc_shader_source];
     id<MTLLibrary> library = [session.device newLibraryWithSource:source options:nil error:&error];
@@ -864,24 +891,46 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
         return;
     }
-    id<MTLComputeCommandEncoder> encoder = [activeCmdBuffer computeCommandEncoder];
-    if (!encoder) {
-        ptmc_release_slot(slot);
-        atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
-        return;
+    if (ptmc_codec_is_hevc(session.codecName)) {
+        id<MTLComputeCommandEncoder> encoder = [activeCmdBuffer computeCommandEncoder];
+        if (!encoder) {
+            ptmc_release_slot(slot);
+            atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
+            return;
+        }
+        [encoder setComputePipelineState:session.pipelineBGRA];
+        [encoder setTexture:texture atIndex:0];
+        [encoder setTexture:slot.yTexture atIndex:1];
+        [encoder setTexture:slot.uvTexture atIndex:2];
+        uint32_t srgb = sourceSRGB ? 1 : 0;
+        [encoder setBytes:&srgb length:sizeof(srgb) atIndex:0];
+        NSUInteger w = session.pipelineBGRA.threadExecutionWidth;
+        NSUInteger h = MAX(1, session.pipelineBGRA.maxTotalThreadsPerThreadgroup / w);
+        MTLSize tg = MTLSizeMake(w, MIN(h, 16), 1);
+        MTLSize grid = MTLSizeMake(texture.width, texture.height, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+        [encoder endEncoding];
+    } else {
+        // ProRes can consume BGRA. A direct GPU blit avoids PTMC's full-frame RGB->NV12 compute
+        // pass and leaves color conversion to Apple's hardware video encoder.
+        id<MTLBlitCommandEncoder> blit = [activeCmdBuffer blitCommandEncoder];
+        if (!blit || !slot.bgraTexture) {
+            [blit endEncoding];
+            ptmc_release_slot(slot);
+            atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
+            return;
+        }
+        [blit copyFromTexture:texture
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(texture.width, texture.height, 1)
+                    toTexture:slot.bgraTexture
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
     }
-    [encoder setComputePipelineState:session.pipelineBGRA];
-    [encoder setTexture:texture atIndex:0];
-    [encoder setTexture:slot.yTexture atIndex:1];
-    [encoder setTexture:slot.uvTexture atIndex:2];
-    uint32_t srgb = sourceSRGB ? 1 : 0;
-    [encoder setBytes:&srgb length:sizeof(srgb) atIndex:0];
-    NSUInteger w = session.pipelineBGRA.threadExecutionWidth;
-    NSUInteger h = MAX(1, session.pipelineBGRA.maxTotalThreadsPerThreadgroup / w);
-    MTLSize tg = MTLSizeMake(w, MIN(h, 16), 1);
-    MTLSize grid = MTLSizeMake(texture.width, texture.height, 1);
-    [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
-    [encoder endEncoding];
 
     uint64_t zero = 0;
     atomic_compare_exchange_strong_explicit(&session->_firstTick, &zero, tick, memory_order_acq_rel, memory_order_relaxed);
