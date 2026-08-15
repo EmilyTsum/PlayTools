@@ -1086,14 +1086,10 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_fetch_add_explicit(&_skippedRate, 1, memory_order_relaxed);
         return;
     } else {
-        uint64_t advanced = nextTick;
-        if (tick > nextTick + interval * 4) {
-            // Recover immediately after a long stall/suspend instead of trying to catch up.
-            advanced = tick + interval;
-        } else {
-            do { advanced += interval; } while (advanced <= tick);
-        }
-        atomic_store_explicit(&session->_nextCaptureTick, advanced, memory_order_relaxed);
+        // Rebase on the accepted present. If a frame was accepted slightly early because of jitter
+        // tolerance, carrying the old phase forward can make the following nominal frame look too
+        // early and produce a pathological every-other-frame pattern at ~60 Hz.
+        atomic_store_explicit(&session->_nextCaptureTick, tick + interval, memory_order_relaxed);
     }
     if (atomic_load_explicit(&session->_firstHostTime, memory_order_relaxed) == 0) {
         uint64_t zeroHost = 0;
