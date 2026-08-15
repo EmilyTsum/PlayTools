@@ -199,6 +199,9 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_uint_fast64_t _firstTick;
     atomic_uint_fast64_t _firstHostTime;
     atomic_uint_fast64_t _nextCaptureTick;
+    atomic_uint_fast64_t _lastPresentTick;
+    atomic_uint_fast64_t _presentIntervalEWMATicks;
+    atomic_uint_fast64_t _burstSlotLastUseTick;
     atomic_uint_fast64_t _pendingWrites;
     atomic_int_fast64_t _lastPTSUnits;
 }
@@ -260,6 +263,7 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_uint_fast64_t _presentMilliFPS;
     atomic_uint_fast64_t _captureMilliFPS;
     atomic_uint_fast64_t _encodedMilliFPS;
+    atomic_uint_fast64_t _burstSlotUses;
     atomic_uint_fast64_t _drawableWidth;
     atomic_uint_fast64_t _drawableHeight;
     atomic_int_fast64_t _pixelFormat;
@@ -350,6 +354,7 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
             &manager->_captureMilliFPS, memory_order_relaxed) / 1000.0);
         status[@"encodedFPS"] = @((double)atomic_load_explicit(
             &manager->_encodedMilliFPS, memory_order_relaxed) / 1000.0);
+        status[@"burstSlotUses"] = @(atomic_load_explicit(&manager->_burstSlotUses, memory_order_relaxed));
         status[@"codec"] = manager.codecName ?: @"hevc";
         status[@"drawableWidth"] = @(atomic_load_explicit(&manager->_drawableWidth, memory_order_relaxed));
         status[@"drawableHeight"] = @(atomic_load_explicit(&manager->_drawableHeight, memory_order_relaxed));
@@ -534,12 +539,32 @@ static void ptmc_release_slot(PTMCSlot *slot) {
     atomic_store_explicit(&slot->inUse, false, memory_order_release);
 }
 
-static PTMCSlot *ptmc_acquire_slot(PTMCSession *session) {
-    for (PTMCSlot *slot in session.slots) {
+static PTMCSlot *ptmc_acquire_slot(PTMCSession *session, uint64_t tick, BOOL *usedBurst) {
+    if (usedBurst) *usedBurst = NO;
+    NSUInteger regularCount = MIN((NSUInteger)MAX(session.bufferCount, 0), session.slots.count);
+    for (NSUInteger index = 0; index < regularCount; index++) {
+        PTMCSlot *slot = session.slots[index];
         bool expected = false;
         if (atomic_compare_exchange_strong_explicit(&slot->inUse, &expected, true,
                                                      memory_order_acq_rel, memory_order_relaxed)) {
             return slot;
+        }
+    }
+
+    // A single preallocated burst slot absorbs isolated VideoToolbox latency spikes. The cooldown
+    // keeps it from becoming a permanently deeper raw-frame queue under sustained overload.
+    if (session.slots.count > regularCount) {
+        uint64_t cooldown = ptmc_ns_to_ticks(250000000ull);
+        uint64_t last = atomic_load_explicit(&session->_burstSlotLastUseTick, memory_order_relaxed);
+        if (last == 0 || tick - last >= cooldown) {
+            PTMCSlot *burst = session.slots[regularCount];
+            bool expected = false;
+            if (atomic_compare_exchange_strong_explicit(&burst->inUse, &expected, true,
+                                                         memory_order_acq_rel, memory_order_relaxed)) {
+                atomic_store_explicit(&session->_burstSlotLastUseTick, tick, memory_order_relaxed);
+                if (usedBurst) *usedBurst = YES;
+                return burst;
+            }
         }
     }
     return nil;
@@ -774,7 +799,8 @@ static BOOL ptmc_create_slots(PTMCSession *session) {
         (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
     CVPixelBufferPoolRef pool = NULL;
-    NSDictionary *poolAttrs = @{ (__bridge NSString *)kCVPixelBufferPoolMinimumBufferCountKey: @(session.bufferCount) };
+    NSInteger allocatedSlotCount = session.bufferCount + 1; // cooldown-limited burst slot
+    NSDictionary *poolAttrs = @{ (__bridge NSString *)kCVPixelBufferPoolMinimumBufferCountKey: @(allocatedSlotCount) };
     CVReturn rv = CVPixelBufferPoolCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)poolAttrs,
                                           (__bridge CFDictionaryRef)attrs, &pool);
     if (rv != kCVReturnSuccess || !pool) {
@@ -789,8 +815,8 @@ static BOOL ptmc_create_slots(PTMCSession *session) {
         return NO;
     }
     session.textureCache = cache;
-    NSMutableArray *slots = [NSMutableArray arrayWithCapacity:session.bufferCount];
-    for (NSInteger i = 0; i < session.bufferCount; i++) {
+    NSMutableArray *slots = [NSMutableArray arrayWithCapacity:allocatedSlotCount];
+    for (NSInteger i = 0; i < allocatedSlotCount; i++) {
         CVPixelBufferRef pb = NULL;
         rv = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb);
         if (rv != kCVReturnSuccess || !pb) break;
@@ -829,8 +855,8 @@ static BOOL ptmc_create_slots(PTMCSession *session) {
         [slots addObject:slot];
     }
     CFRelease(pool);
-    if (slots.count != session.bufferCount) {
-        PTMC_LOG(@"failed to preallocate %@ ring (%lu/%ld)",
+    if (slots.count != allocatedSlotCount) {
+        PTMC_LOG(@"failed to preallocate %@ ring (%lu/%ld regular + 1 burst)",
                  hevc ? @"NV12" : @"BGRA", (unsigned long)slots.count, (long)session.bufferCount);
         return NO;
     }
@@ -891,6 +917,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_lastLogTick, mach_continuous_time());
         atomic_init(&_lastLogPresented, 0); atomic_init(&_lastLogCaptured, 0); atomic_init(&_lastLogEncoded, 0);
         atomic_init(&_presentMilliFPS, 0); atomic_init(&_captureMilliFPS, 0); atomic_init(&_encodedMilliFPS, 0);
+        atomic_init(&_burstSlotUses, 0);
         atomic_init(&_drawableWidth, 0); atomic_init(&_drawableHeight, 0); atomic_init(&_pixelFormat, -1);
         atomic_init(&_framebufferOnly, -1); atomic_init(&_displaySync, -1); atomic_init(&_edr, -1);
         atomic_init(&_presentHookCount, 0);
@@ -977,6 +1004,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     atomic_store_explicit(&_presentMilliFPS, 0, memory_order_relaxed);
     atomic_store_explicit(&_captureMilliFPS, 0, memory_order_relaxed);
     atomic_store_explicit(&_encodedMilliFPS, 0, memory_order_relaxed);
+    atomic_store_explicit(&_burstSlotUses, 0, memory_order_relaxed);
     atomic_store_explicit(&_skippedPresents, 0, memory_order_relaxed);
     atomic_store_explicit(&_ownedCaptureCommandBuffers, 0, memory_order_relaxed);
     atomic_store_explicit(&_lastOwnedCaptureGPUTimeUs, 0, memory_order_relaxed);
@@ -1044,7 +1072,9 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         s.writerQueue = dispatch_queue_create("io.playcover.ptmc.writer", writerAttr);
         atomic_init(&s->_accepting, true); atomic_init(&s->_inFlight, 0);
         atomic_init(&s->_firstTick, 0); atomic_init(&s->_firstHostTime, 0);
-        atomic_init(&s->_nextCaptureTick, 0); atomic_init(&s->_pendingWrites, 0);
+        atomic_init(&s->_nextCaptureTick, 0); atomic_init(&s->_lastPresentTick, 0);
+        atomic_init(&s->_presentIntervalEWMATicks, 0); atomic_init(&s->_burstSlotLastUseTick, 0);
+        atomic_init(&s->_pendingWrites, 0);
         atomic_init(&s->_lastPTSUnits, -1);
         s.outputPath = ptmc_output_path_from_environment();
         BOOL ok = ptmc_create_pipelines(s) && ptmc_create_slots(s) && ptmc_create_video_session(s);
@@ -1095,19 +1125,39 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     // captured frame can accidentally turn a nominal 60 Hz stream into ~30 fps when presents land
     // a fraction of a millisecond before the exact 16.667 ms boundary. Keep a stable deadline instead.
     uint64_t interval = session.captureIntervalTicks;
-    uint64_t tolerance = MIN(interval / 8, ptmc_ns_to_ticks(1000000ull)); // <= 1 ms
+    uint64_t lastPresent = atomic_exchange_explicit(&session->_lastPresentTick, tick, memory_order_acq_rel);
+    uint64_t presentEWMA = atomic_load_explicit(&session->_presentIntervalEWMATicks, memory_order_relaxed);
+    if (lastPresent != 0 && tick > lastPresent) {
+        uint64_t sample = tick - lastPresent;
+        presentEWMA = presentEWMA == 0 ? sample : (presentEWMA * 7 + sample) / 8;
+        atomic_store_explicit(&session->_presentIntervalEWMATicks, presentEWMA, memory_order_relaxed);
+    }
+
+    // If the source is effectively at the requested capture rate, accept every present. Tiny
+    // frame-pacing jitter around 60 Hz must not become visible one/two-frame capture holes. Only
+    // engage the rate limiter once the source is clearly faster (~>6%), e.g. 120 Hz -> 60 fps.
+    BOOL sourceClearlyFaster = presentEWMA != 0 && presentEWMA * 100 < interval * 94;
     uint64_t nextTick = atomic_load_explicit(&session->_nextCaptureTick, memory_order_relaxed);
-    if (nextTick == 0) {
+    if (!sourceClearlyFaster) {
         atomic_store_explicit(&session->_nextCaptureTick, tick + interval, memory_order_relaxed);
-    } else if (tick + tolerance < nextTick) {
-        // Intentional sampling skip (e.g. source 120 Hz -> capture 60 fps), not an encoder drop.
-        atomic_fetch_add_explicit(&_skippedRate, 1, memory_order_relaxed);
-        return;
     } else {
-        // Rebase on the accepted present. If a frame was accepted slightly early because of jitter
-        // tolerance, carrying the old phase forward can make the following nominal frame look too
-        // early and produce a pathological every-other-frame pattern at ~60 Hz.
-        atomic_store_explicit(&session->_nextCaptureTick, tick + interval, memory_order_relaxed);
+        uint64_t tolerance = MIN(interval / 16, ptmc_ns_to_ticks(250000ull)); // <= 0.25 ms
+        if (nextTick == 0) {
+            atomic_store_explicit(&session->_nextCaptureTick, tick + interval, memory_order_relaxed);
+        } else if (tick + tolerance < nextTick) {
+            // Intentional sampling skip from a genuinely faster source, not an encoder drop.
+            atomic_fetch_add_explicit(&_skippedRate, 1, memory_order_relaxed);
+            return;
+        } else {
+            uint64_t advanced = nextTick;
+            if (tick > nextTick + interval * 4) {
+                // Long suspend/stall: discard accumulated timing debt instead of burst-catching up.
+                advanced = tick + interval;
+            } else {
+                do { advanced += interval; } while (advanced <= tick);
+            }
+            atomic_store_explicit(&session->_nextCaptureTick, advanced, memory_order_relaxed);
+        }
     }
     if (atomic_load_explicit(&session->_firstHostTime, memory_order_relaxed) == 0) {
         uint64_t zeroHost = 0;
@@ -1115,11 +1165,13 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_compare_exchange_strong_explicit(&session->_firstHostTime, &zeroHost, hostNow,
                                                 memory_order_acq_rel, memory_order_relaxed);
     }
-    PTMCSlot *slot = ptmc_acquire_slot(session);
+    BOOL usedBurstSlot = NO;
+    PTMCSlot *slot = ptmc_acquire_slot(session, tick, &usedBurstSlot);
     if (!slot) {
         atomic_fetch_add_explicit(&_droppedPool, 1, memory_order_relaxed);
         return;
     }
+    if (usedBurstSlot) atomic_fetch_add_explicit(&_burstSlotUses, 1, memory_order_relaxed);
     id<MTLCommandBuffer> activeCmdBuffer = commandBuffer;
     BOOL ownsCmdBuffer = NO;
     if (!activeCmdBuffer) {
