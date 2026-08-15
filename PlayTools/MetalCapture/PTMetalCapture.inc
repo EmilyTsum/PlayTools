@@ -52,6 +52,13 @@ static double ptmc_env_double(const char *name, double fallback, double minValue
     return parsed;
 }
 
+static NSString *ptmc_env_string(const char *name, NSString *fallback) {
+    const char *v = getenv(name);
+    if (!v || !*v) return fallback;
+    NSString *value = [[NSString alloc] initWithUTF8String:v];
+    return value.length > 0 ? value : fallback;
+}
+
 static uint64_t ptmc_ticks_to_ns(uint64_t ticks) {
     static mach_timebase_info_data_t info;
     static dispatch_once_t once;
@@ -178,6 +185,8 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_bool _accepting;
     atomic_uint_fast64_t _inFlight;
     atomic_uint_fast64_t _firstTick;
+    atomic_uint_fast64_t _firstHostTime;
+    atomic_uint_fast64_t _lastCaptureTick;
     atomic_int_fast64_t _lastPTSUnits;
 }
 @property(nonatomic) uint64_t generation;
@@ -185,6 +194,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) NSUInteger height;
 @property(nonatomic) NSInteger fps;
 @property(nonatomic) NSInteger bitrate;
+@property(nonatomic, copy) NSString *codecName;
 @property(nonatomic) NSInteger bufferCount;
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLComputePipelineState> pipelineBGRA;
@@ -222,6 +232,7 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_uint_fast64_t _droppedEncoder;
     atomic_uint_fast64_t _droppedLate;
     atomic_uint_fast64_t _droppedUnsupported;
+    atomic_uint_fast64_t _skippedRate;
     atomic_uint_fast64_t _lastLogTick;
     atomic_uint_fast64_t _lastLogPresented;
     atomic_uint_fast64_t _lastLogEncoded;
@@ -237,6 +248,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) dispatch_queue_t controlQueue;
 @property(nonatomic) NSInteger fps;
 @property(nonatomic) NSInteger bitrate;
+@property(nonatomic, copy) NSString *codecName;
 @property(nonatomic) NSInteger bufferCount;
 @property(nonatomic) double logInterval;
 @property(nonatomic) BOOL disableDisplaySync;
@@ -279,6 +291,8 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
         status[@"droppedEncoder"] = @(atomic_load_explicit(&manager->_droppedEncoder, memory_order_relaxed));
         status[@"droppedLate"] = @(atomic_load_explicit(&manager->_droppedLate, memory_order_relaxed));
         status[@"unsupported"] = @(atomic_load_explicit(&manager->_droppedUnsupported, memory_order_relaxed));
+        status[@"skippedRate"] = @(atomic_load_explicit(&manager->_skippedRate, memory_order_relaxed));
+        status[@"codec"] = manager.codecName ?: @"hevc";
         status[@"drawableWidth"] = @(atomic_load_explicit(&manager->_drawableWidth, memory_order_relaxed));
         status[@"drawableHeight"] = @(atomic_load_explicit(&manager->_drawableHeight, memory_order_relaxed));
         status[@"pixelFormat"] = @(atomic_load_explicit(&manager->_pixelFormat, memory_order_relaxed));
@@ -294,6 +308,8 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
             status[@"height"] = @(session.height);
             status[@"fps"] = @(session.fps);
             status[@"bitrate"] = @(session.bitrate);
+            status[@"codec"] = session.codecName ?: manager.codecName ?: @"hevc";
+            status[@"firstVideoHostTime"] = @(atomic_load_explicit(&session->_firstHostTime, memory_order_acquire));
             if (session.outputPath.length > 0) status[@"outputPath"] = session.outputPath;
         }
         NSURL *url = [NSURL fileURLWithPath:path];
@@ -434,8 +450,8 @@ static BOOL ptmc_ensure_writer(PTMCSession *session, CMSampleBufferRef sampleBuf
                                                             sourceFormatHint:format];
     input.expectsMediaDataInRealTime = YES;
     if (![writer canAddInput:input]) {
-        PTMC_LOG(@"AVAssetWriter cannot add HEVC passthrough input");
-        ptmc_publish_status(ptmc_manager(), session, @"error", @"AVAssetWriter cannot add HEVC passthrough input");
+        PTMC_LOG(@"AVAssetWriter cannot add compressed-video passthrough input");
+        ptmc_publish_status(ptmc_manager(), session, @"error", @"AVAssetWriter cannot add compressed-video passthrough input");
         return NO;
     }
     [writer addInput:input];
@@ -447,7 +463,7 @@ static BOOL ptmc_ensure_writer(PTMCSession *session, CMSampleBufferRef sampleBuf
     [writer startSessionAtSourceTime:kCMTimeZero];
     session.writer = writer;
     session.writerInput = input;
-    ptmc_publish_status(ptmc_manager(), session, @"recording", @"HEVC writer started");
+    ptmc_publish_status(ptmc_manager(), session, @"recording", [NSString stringWithFormat:@"%@ writer started", session.codecName.uppercaseString ?: @"VIDEO"]);
     return YES;
 }
 
@@ -495,25 +511,25 @@ static void ptmc_vt_output_callback(void *outputCallbackRefCon,
     });
 }
 
+static CMVideoCodecType ptmc_codec_type(NSString *codecName) {
+    NSString *name = codecName.lowercaseString;
+    if ([name isEqualToString:@"prores422lt"]) return kCMVideoCodecType_AppleProRes422LT;
+    if ([name isEqualToString:@"prores422"]) return kCMVideoCodecType_AppleProRes422;
+    if ([name isEqualToString:@"prores422hq"]) return kCMVideoCodecType_AppleProRes422HQ;
+    return kCMVideoCodecType_HEVC;
+}
+
+static BOOL ptmc_codec_is_hevc(NSString *codecName) {
+    return codecName.length == 0 || [codecName.lowercaseString isEqualToString:@"hevc"];
+}
+
 static BOOL ptmc_create_video_session(PTMCSession *session) {
-    NSMutableDictionary *encoderSpec = [NSMutableDictionary dictionary];
-    // RequireHardwareAcceleratedVideoEncoder was added after our iOS 15 build target.
-    // Resolve it dynamically so the patched iOS binary keeps its upstream deployment target.
-    CFStringRef requireHWKey = NULL;
-    void *requireHWSymbol = dlsym(RTLD_DEFAULT, "kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder");
-    if (requireHWSymbol) requireHWKey = *(CFStringRef *)requireHWSymbol;
-    if (requireHWKey) {
-        encoderSpec[(__bridge NSString *)requireHWKey] = @YES;
-    } else {
-        CFStringRef enableHWKey = NULL;
-        void *enableHWSymbol = dlsym(RTLD_DEFAULT, "kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder");
-        if (enableHWSymbol) enableHWKey = *(CFStringRef *)enableHWSymbol;
-        if (enableHWKey) {
-            encoderSpec[(__bridge NSString *)enableHWKey] = @YES;
-            PTMC_LOG(@"hardware-required key unavailable; hardware acceleration is requested");
-        } else {
-            PTMC_LOG(@"hardware encoder-selection keys unavailable at runtime");
-        }
+    NSDictionary *encoderSpec = @{};
+    if (@available(iOS 13.0, *)) {
+        encoderSpec = @{
+            (__bridge NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+            (__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES
+        };
     }
     NSDictionary *sourceAttrs = @{
         (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
@@ -523,10 +539,11 @@ static BOOL ptmc_create_video_session(PTMCSession *session) {
         (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
     };
     VTCompressionSessionRef vt = NULL;
+    CMVideoCodecType codec = ptmc_codec_type(session.codecName);
     OSStatus err = VTCompressionSessionCreate(kCFAllocatorDefault,
                                                (int32_t)session.width,
                                                (int32_t)session.height,
-                                               kCMVideoCodecType_HEVC,
+                                               codec,
                                                (__bridge CFDictionaryRef)encoderSpec,
                                                (__bridge CFDictionaryRef)sourceAttrs,
                                                NULL,
@@ -534,32 +551,40 @@ static BOOL ptmc_create_video_session(PTMCSession *session) {
                                                NULL,
                                                &vt);
     if (err != noErr || !vt) {
-        PTMC_LOG(@"hardware HEVC session creation failed: %d", (int)err);
+        PTMC_LOG(@"%@ hardware video session creation failed: %d", session.codecName.uppercaseString, (int)err);
         return NO;
     }
-    session.compressionSession = vt;
     VTSessionSetProperty(vt, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(vt, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-    VTSessionSetProperty(vt, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel);
     NSInteger expectedFPS = session.fps;
     CFNumberRef fps = CFNumberCreate(kCFAllocatorDefault, kCFNumberNSIntegerType, &expectedFPS);
     if (fps) { VTSessionSetProperty(vt, kVTCompressionPropertyKey_ExpectedFrameRate, fps); CFRelease(fps); }
-    NSInteger bitrate = session.bitrate;
-    CFNumberRef br = CFNumberCreate(kCFAllocatorDefault, kCFNumberNSIntegerType, &bitrate);
-    if (br) { VTSessionSetProperty(vt, kVTCompressionPropertyKey_AverageBitRate, br); CFRelease(br); }
-    NSInteger keyInterval = MAX(session.fps * 2, 1);
-    CFNumberRef key = CFNumberCreate(kCFAllocatorDefault, kCFNumberNSIntegerType, &keyInterval);
-    if (key) { VTSessionSetProperty(vt, kVTCompressionPropertyKey_MaxKeyFrameInterval, key); CFRelease(key); }
+    if (ptmc_codec_is_hevc(session.codecName)) {
+        VTSessionSetProperty(vt, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel);
+        NSInteger averageBitrate = session.bitrate;
+        CFNumberRef br = CFNumberCreate(kCFAllocatorDefault, kCFNumberNSIntegerType, &averageBitrate);
+        if (br) { VTSessionSetProperty(vt, kVTCompressionPropertyKey_AverageBitRate, br); CFRelease(br); }
+        NSInteger keyInterval = MAX(session.fps * 2, 1);
+        CFNumberRef key = CFNumberCreate(kCFAllocatorDefault, kCFNumberNSIntegerType, &keyInterval);
+        if (key) { VTSessionSetProperty(vt, kVTCompressionPropertyKey_MaxKeyFrameInterval, key); CFRelease(key); }
+    }
     VTSessionSetProperty(vt, kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
     VTSessionSetProperty(vt, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
     VTSessionSetProperty(vt, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
     err = VTCompressionSessionPrepareToEncodeFrames(vt);
     if (err != noErr) {
-        PTMC_LOG(@"VT prepare failed: %d", (int)err);
+        PTMC_LOG(@"VT prepare failed for %@: %d", session.codecName, (int)err);
+        VTCompressionSessionInvalidate(vt);
+        CFRelease(vt);
         return NO;
     }
-    PTMC_LOG(@"encoder HEVC hardware required, %ldx%ld @ %ld fps, bitrate=%ld",
-             (long)session.width, (long)session.height, (long)session.fps, (long)session.bitrate);
+    session.compressionSession = vt;
+    PTMC_LOG(@"encoder %@ hardware required, %ldx%ld @ %ld fps%@",
+             session.codecName.uppercaseString,
+             (long)session.width, (long)session.height, (long)session.fps,
+             ptmc_codec_is_hevc(session.codecName)
+                ? [NSString stringWithFormat:@", bitrate=%ld", (long)session.bitrate]
+                : @"");
     return YES;
 }
 
@@ -648,7 +673,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_preparing, false);
         atomic_init(&_generation, 1);
         atomic_init(&_presented, 0); atomic_init(&_captured, 0); atomic_init(&_encoded, 0);
-        atomic_init(&_droppedPool, 0); atomic_init(&_droppedEncoder, 0); atomic_init(&_droppedLate, 0); atomic_init(&_droppedUnsupported, 0);
+        atomic_init(&_droppedPool, 0); atomic_init(&_droppedEncoder, 0); atomic_init(&_droppedLate, 0); atomic_init(&_droppedUnsupported, 0); atomic_init(&_skippedRate, 0);
         atomic_init(&_lastLogTick, mach_continuous_time()); atomic_init(&_lastLogPresented, 0); atomic_init(&_lastLogEncoded, 0);
         atomic_init(&_drawableWidth, 0); atomic_init(&_drawableHeight, 0); atomic_init(&_pixelFormat, -1);
         atomic_init(&_framebufferOnly, -1); atomic_init(&_displaySync, -1); atomic_init(&_edr, -1);
@@ -660,43 +685,43 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 
 - (void)reloadConfiguration {
     NSDictionary *config = ptmc_read_runtime_config();
-
     NSNumber *enabledValue = [config[@"enabled"] isKindOfClass:[NSNumber class]] ? config[@"enabled"] : nil;
+    long long configFPS = [config[@"fps"] respondsToSelector:@selector(longLongValue)] ? [config[@"fps"] longLongValue] : 120;
+    long long configBitrate = [config[@"bitrate"] respondsToSelector:@selector(longLongValue)] ? [config[@"bitrate"] longLongValue] : 120000000;
+    long long configBuffers = [config[@"buffers"] respondsToSelector:@selector(longLongValue)] ? [config[@"buffers"] longLongValue] : 6;
+    double configLogInterval = [config[@"logInterval"] respondsToSelector:@selector(doubleValue)] ? [config[@"logInterval"] doubleValue] : 1.0;
+    BOOL configDisableDisplaySync = [config[@"disableDisplaySync"] respondsToSelector:@selector(boolValue)] ? [config[@"disableDisplaySync"] boolValue] : NO;
+    BOOL configForceSDR = [config[@"forceSDRDisplay"] respondsToSelector:@selector(boolValue)] ? [config[@"forceSDRDisplay"] boolValue] : YES;
+    long long configSpoofFPS = [config[@"spoofMaxFPS"] respondsToSelector:@selector(longLongValue)] ? [config[@"spoofMaxFPS"] longLongValue] : 0;
+    NSString *configCodec = [config[@"codec"] isKindOfClass:[NSString class]] ? [config[@"codec"] lowercaseString] : @"hevc";
+
     self.captureEnabled = enabledValue ? enabledValue.boolValue : ptmc_env_bool("PTMC_ENABLE", false);
+    self.fps = (NSInteger)ptmc_env_ll("PTMC_FPS", configFPS, 1, 240);
+    self.bitrate = (NSInteger)ptmc_env_ll("PTMC_BITRATE", configBitrate, 1000000, 1000000000);
+    self.bufferCount = (NSInteger)ptmc_env_ll("PTMC_BUFFERS", configBuffers, 3, 16);
+    self.logInterval = ptmc_env_double("PTMC_LOG_INTERVAL", configLogInterval, 0.25, 60.0);
+    self.disableDisplaySync = ptmc_env_bool("PTMC_DISABLE_DISPLAY_SYNC", configDisableDisplaySync);
+    self.forceSDRDisplay = ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", configForceSDR);
+    ptmc_spoof_max_fps = (NSInteger)ptmc_env_ll("PTMC_SPOOF_MAX_FPS", configSpoofFPS, 0, 240);
+    NSString *codec = [ptmc_env_string("PTMC_CODEC", configCodec) lowercaseString];
+    if (![codec isEqualToString:@"hevc"] &&
+        ![codec isEqualToString:@"prores422lt"] &&
+        ![codec isEqualToString:@"prores422"] &&
+        ![codec isEqualToString:@"prores422hq"]) {
+        PTMC_LOG(@"unknown codec '%@'; falling back to HEVC", codec);
+        codec = @"hevc";
+    }
+    self.codecName = codec;
 
-    NSNumber *fpsValue = [config[@"fps"] isKindOfClass:[NSNumber class]] ? config[@"fps"] : nil;
-    NSNumber *bitrateValue = [config[@"bitrate"] isKindOfClass:[NSNumber class]] ? config[@"bitrate"] : nil;
-    NSNumber *buffersValue = [config[@"buffers"] isKindOfClass:[NSNumber class]] ? config[@"buffers"] : nil;
-    NSNumber *logValue = [config[@"logInterval"] isKindOfClass:[NSNumber class]] ? config[@"logInterval"] : nil;
-    NSNumber *displaySyncValue = [config[@"disableDisplaySync"] isKindOfClass:[NSNumber class]] ? config[@"disableDisplaySync"] : nil;
-    NSNumber *forceSDRValue = [config[@"forceSDRDisplay"] isKindOfClass:[NSNumber class]] ? config[@"forceSDRDisplay"] : nil;
-    NSNumber *spoofValue = [config[@"spoofMaxFPS"] isKindOfClass:[NSNumber class]] ? config[@"spoofMaxFPS"] : nil;
-
-    self.fps = fpsValue ? MAX(1, MIN(240, fpsValue.integerValue))
-                        : (NSInteger)ptmc_env_ll("PTMC_FPS", 120, 1, 240);
-    self.bitrate = bitrateValue ? MAX(1000000, MIN(1000000000, bitrateValue.integerValue))
-                                : (NSInteger)ptmc_env_ll("PTMC_BITRATE", 120000000, 1000000, 1000000000);
-    self.bufferCount = buffersValue ? MAX(3, MIN(16, buffersValue.integerValue))
-                                    : (NSInteger)ptmc_env_ll("PTMC_BUFFERS", 6, 3, 16);
-    self.logInterval = logValue ? MAX(0.25, MIN(60.0, logValue.doubleValue))
-                                : ptmc_env_double("PTMC_LOG_INTERVAL", 1.0, 0.25, 60.0);
-    self.disableDisplaySync = displaySyncValue ? displaySyncValue.boolValue
-                                               : ptmc_env_bool("PTMC_DISABLE_DISPLAY_SYNC", false);
-    self.forceSDRDisplay = forceSDRValue ? forceSDRValue.boolValue
-                                         : ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", true);
-    ptmc_spoof_max_fps = spoofValue ? MAX(0, MIN(240, spoofValue.integerValue))
-                                    : (NSInteger)ptmc_env_ll("PTMC_SPOOF_MAX_FPS", 0, 0, 240);
-
-    NSString *configuredStatus = [config[@"statusFile"] isKindOfClass:[NSString class]] ? config[@"statusFile"] : nil;
-    if (configuredStatus.length > 0) {
-        self.statusPath = [configuredStatus stringByExpandingTildeInPath];
+    const char *statusFile = getenv("PTMC_STATUS_FILE");
+    if (statusFile && *statusFile) {
+        self.statusPath = [[[NSString alloc] initWithUTF8String:statusFile] stringByExpandingTildeInPath];
     } else {
-        const char *statusFile = getenv("PTMC_STATUS_FILE");
-        self.statusPath = statusFile && *statusFile
-            ? [[[NSString alloc] initWithUTF8String:statusFile] stringByExpandingTildeInPath]
-            : ptmc_default_status_path();
+        NSString *configuredStatus = [config[@"statusFile"] isKindOfClass:[NSString class]] ? config[@"statusFile"] : nil;
+        self.statusPath = configuredStatus.length > 0 ? [configuredStatus stringByExpandingTildeInPath] : ptmc_default_status_path();
     }
 }
+
 - (void)start {
     [self reloadConfiguration];
     atomic_store_explicit(&_requested, true, memory_order_release);
@@ -734,17 +759,17 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         }
         PTMCSession *s = [[PTMCSession alloc] init];
         s.generation = atomic_fetch_add_explicit(&self->_generation, 1, memory_order_acq_rel) + 1;
-        s.width = width; s.height = height; s.fps = self.fps; s.bitrate = self.bitrate; s.bufferCount = self.bufferCount;
+        s.width = width; s.height = height; s.fps = self.fps; s.bitrate = self.bitrate; s.codecName = self.codecName; s.bufferCount = self.bufferCount;
         s.device = device;
         s.encoderQueue = dispatch_queue_create("io.playcover.ptmc.encoder", DISPATCH_QUEUE_SERIAL);
-        atomic_init(&s->_accepting, true); atomic_init(&s->_inFlight, 0); atomic_init(&s->_firstTick, 0); atomic_init(&s->_lastPTSUnits, -1);
+        atomic_init(&s->_accepting, true); atomic_init(&s->_inFlight, 0); atomic_init(&s->_firstTick, 0); atomic_init(&s->_firstHostTime, 0); atomic_init(&s->_lastCaptureTick, 0); atomic_init(&s->_lastPTSUnits, -1);
         s.outputPath = ptmc_output_path_from_environment();
         BOOL ok = ptmc_create_pipelines(s) && ptmc_create_slots(s) && ptmc_create_video_session(s);
         if (ok && atomic_load_explicit(&self->_requested, memory_order_acquire)) {
             self.session = s;
-            PTMC_LOG(@"capture armed generation=%llu drawable=%lux%lu buffers=%ld output=%@",
+            PTMC_LOG(@"capture armed generation=%llu drawable=%lux%lu codec=%@ buffers=%ld output=%@",
                      (unsigned long long)s.generation, (unsigned long)s.width, (unsigned long)s.height,
-                     (long)s.bufferCount, s.outputPath);
+                     s.codecName, (long)s.bufferCount, s.outputPath);
             ptmc_publish_status(self, s, @"armed", @"Capture session armed");
         } else {
             atomic_store_explicit(&s->_accepting, false, memory_order_release);
@@ -778,6 +803,18 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_fetch_add_explicit(&_droppedUnsupported, 1, memory_order_relaxed);
         return;
     }
+    // The configured FPS is a real capture-rate ceiling, not just encoder metadata. A 120 Hz
+    // game captured at 60 fps now performs roughly half as many BGRA->NV12 conversions/encodes.
+    uint64_t lastCapture = atomic_load_explicit(&session->_lastCaptureTick, memory_order_relaxed);
+    uint64_t intervalNs = 1000000000ull / (uint64_t)MAX(session.fps, 1);
+    if (lastCapture != 0 && ptmc_ticks_to_ns(tick - lastCapture) < intervalNs) {
+        atomic_fetch_add_explicit(&_skippedRate, 1, memory_order_relaxed);
+        return;
+    }
+    atomic_store_explicit(&session->_lastCaptureTick, tick, memory_order_relaxed);
+    uint64_t zeroHost = 0;
+    uint64_t hostNow = mach_absolute_time();
+    atomic_compare_exchange_strong_explicit(&session->_firstHostTime, &zeroHost, hostNow, memory_order_acq_rel, memory_order_relaxed);
     PTMCSlot *slot = ptmc_acquire_slot(session);
     if (!slot) {
         atomic_fetch_add_explicit(&_droppedPool, 1, memory_order_relaxed);
@@ -884,14 +921,14 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     uint64_t e = atomic_load_explicit(&_encoded, memory_order_relaxed);
     uint64_t lp = atomic_exchange_explicit(&_lastLogPresented, p, memory_order_acq_rel);
     uint64_t le = atomic_exchange_explicit(&_lastLogEncoded, e, memory_order_acq_rel);
-    PTMC_LOG(@"present=%.2f fps drawable=%llux%llu pixelFormat=%lld displaySync=%lld framebufferOnly=%lld captured=%llu encoded=%.2f fps dropped_pool=%llu dropped_encoder=%llu dropped_late=%llu unsupported=%llu requested=%d",
+    PTMC_LOG(@"present=%.2f fps drawable=%llux%llu pixelFormat=%lld displaySync=%lld framebufferOnly=%lld captured=%llu encoded=%.2f fps dropped_pool=%llu dropped_encoder=%llu dropped_late=%llu unsupported=%llu skipped_rate=%llu codec=%@ requested=%d",
              (p - lp) / seconds,
              (unsigned long long)atomic_load(&_drawableWidth), (unsigned long long)atomic_load(&_drawableHeight),
              (long long)atomic_load(&_pixelFormat), (long long)atomic_load(&_displaySync), (long long)atomic_load(&_framebufferOnly),
              (unsigned long long)atomic_load(&_captured), (e - le) / seconds,
              (unsigned long long)atomic_load(&_droppedPool), (unsigned long long)atomic_load(&_droppedEncoder),
              (unsigned long long)atomic_load(&_droppedLate), (unsigned long long)atomic_load(&_droppedUnsupported),
-             atomic_load(&_requested));
+             (unsigned long long)atomic_load(&_skippedRate), self.codecName ?: @"hevc", atomic_load(&_requested));
     BOOL requested = atomic_load_explicit(&_requested, memory_order_acquire);
     if (force || requested) {
         PTMCSession *session = self.session;
@@ -1316,8 +1353,8 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
     }
     _dyld_register_func_for_add_image(ptmc_image_added);
     ptmc_schedule_discovery();
-    PTMC_LOG(@"hooks ready bundle=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d forceSDR=%d spoofMaxFPS=%ld enabled=%d",
-             bundleIdentifier ?: @"(unknown)",
+    PTMC_LOG(@"hooks ready bundle=%@ codec=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d forceSDR=%d spoofMaxFPS=%ld enabled=%d",
+             bundleIdentifier ?: @"(unknown)", manager.codecName ?: @"hevc",
              (long)manager.fps, (long)manager.bitrate, (long)manager.bufferCount,
              manager.disableDisplaySync, manager.forceSDRDisplay, (long)ptmc_spoof_max_fps, enabled);
     ptmc_publish_status(manager, nil, @"ready", @"PTMC hooks loaded and waiting for capture commands");
