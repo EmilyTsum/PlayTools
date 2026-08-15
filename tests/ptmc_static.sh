@@ -70,6 +70,7 @@ grep -q 'Deadline-based sampling' "$INC"
 
 grep -q 'presentFPS' "$INC"
 grep -q 'captureFPS' "$INC"
-grep -q 'encodedFPS' "$INC"grep -q 'sourceClearlyFaster' "$INC"
+grep -q 'encodedFPS' "$INC"
+grep -q 'sourceClearlyFaster' "$INC"
 grep -q 'burstSlotUses' "$INC"
 grep -q 'allocatedSlotCount = session.bufferCount + 1' "$INC"
