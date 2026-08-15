@@ -78,6 +78,45 @@ static NSString *ptmc_real_user_home(void) {
     return home;
 }
 
+static NSString *ptmc_shared_container_path(void) {
+    return [ptmc_real_user_home() stringByAppendingPathComponent:@"Library/Containers/io.playcover.PlayCover"];
+}
+
+static NSString *ptmc_bundle_identifier(void) {
+    NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
+    return bundleIdentifier.length > 0 ? bundleIdentifier : @"unknown";
+}
+
+static NSString *ptmc_runtime_config_path(void) {
+    return [[[ptmc_shared_container_path() stringByAppendingPathComponent:@"PTMC Config"]
+             stringByAppendingPathComponent:ptmc_bundle_identifier()] stringByAppendingPathExtension:@"plist"];
+}
+
+static NSString *ptmc_default_status_path(void) {
+    return [[[ptmc_shared_container_path() stringByAppendingPathComponent:@"PTMC Status"]
+             stringByAppendingPathComponent:ptmc_bundle_identifier()] stringByAppendingPathExtension:@"plist"];
+}
+
+static NSString *ptmc_default_capture_directory(void) {
+    return [[ptmc_shared_container_path() stringByAppendingPathComponent:@"Captures"]
+            stringByAppendingPathComponent:ptmc_bundle_identifier()];
+}
+
+static NSDictionary *ptmc_read_runtime_config(void) {
+    NSData *data = [NSData dataWithContentsOfFile:ptmc_runtime_config_path()];
+    if (!data) return @{};
+    NSError *error = nil;
+    id object = [NSPropertyListSerialization propertyListWithData:data
+                                                          options:NSPropertyListImmutable
+                                                           format:NULL
+                                                            error:&error];
+    if (![object isKindOfClass:[NSDictionary class]]) {
+        if (error) PTMC_LOG(@"runtime config read failed: %@", error);
+        return @{};
+    }
+    return (NSDictionary *)object;
+}
+
 static NSString *ptmc_timestamped_output_path(NSString *directory) {
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
@@ -96,7 +135,13 @@ static NSString *ptmc_output_path_from_environment(void) {
         NSString *directory = [[[NSString alloc] initWithUTF8String:outDir] stringByExpandingTildeInPath];
         return ptmc_timestamped_output_path(directory);
     }
-    return ptmc_timestamped_output_path([ptmc_real_user_home() stringByAppendingPathComponent:@"Movies"]);
+    NSDictionary *config = ptmc_read_runtime_config();
+    NSString *configuredDirectory = [config[@"outputDirectory"] isKindOfClass:[NSString class]]
+        ? config[@"outputDirectory"] : nil;
+    NSString *directory = configuredDirectory.length > 0
+        ? [configuredDirectory stringByExpandingTildeInPath]
+        : ptmc_default_capture_directory();
+    return ptmc_timestamped_output_path(directory);
 }
 
 @interface PTMCSlot : NSObject {
@@ -194,6 +239,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) BOOL disableDisplaySync;
 @property(nonatomic) BOOL forceSDRDisplay;
 @property(nonatomic, copy) NSString *statusPath;
+- (void)reloadConfiguration;
 - (void)start;
 - (void)stop;
 - (void)prepareForTexture:(id<MTLTexture>)texture;
@@ -202,6 +248,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @end
 
 static PTMCManager *ptmc_manager(void);
+static NSInteger ptmc_spoof_max_fps = 0;
 
 static dispatch_queue_t ptmc_status_queue(void) {
     static dispatch_queue_t queue;
@@ -596,19 +643,40 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_lastLogTick, mach_continuous_time()); atomic_init(&_lastLogPresented, 0); atomic_init(&_lastLogEncoded, 0);
         atomic_init(&_drawableWidth, 0); atomic_init(&_drawableHeight, 0); atomic_init(&_pixelFormat, -1);
         atomic_init(&_framebufferOnly, -1); atomic_init(&_displaySync, -1); atomic_init(&_edr, -1);
-        _fps = (NSInteger)ptmc_env_ll("PTMC_FPS", 120, 1, 240);
-        _bitrate = (NSInteger)ptmc_env_ll("PTMC_BITRATE", 120000000, 1000000, 1000000000);
-        _bufferCount = (NSInteger)ptmc_env_ll("PTMC_BUFFERS", 6, 3, 16);
-        _logInterval = ptmc_env_double("PTMC_LOG_INTERVAL", 1.0, 0.25, 60.0);
-        _disableDisplaySync = ptmc_env_bool("PTMC_DISABLE_DISPLAY_SYNC", false);
-        _forceSDRDisplay = ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", false);
-        const char *statusFile = getenv("PTMC_STATUS_FILE");
-        if (statusFile && *statusFile) _statusPath = [[[NSString alloc] initWithUTF8String:statusFile] stringByExpandingTildeInPath];
+        [self reloadConfiguration];
     }
     return self;
 }
 
+- (void)reloadConfiguration {
+    NSDictionary *config = ptmc_read_runtime_config();
+    long long configFPS = [config[@"fps"] respondsToSelector:@selector(longLongValue)] ? [config[@"fps"] longLongValue] : 120;
+    long long configBitrate = [config[@"bitrate"] respondsToSelector:@selector(longLongValue)] ? [config[@"bitrate"] longLongValue] : 120000000;
+    long long configBuffers = [config[@"buffers"] respondsToSelector:@selector(longLongValue)] ? [config[@"buffers"] longLongValue] : 6;
+    double configLogInterval = [config[@"logInterval"] respondsToSelector:@selector(doubleValue)] ? [config[@"logInterval"] doubleValue] : 1.0;
+    BOOL configDisableDisplaySync = [config[@"disableDisplaySync"] respondsToSelector:@selector(boolValue)] ? [config[@"disableDisplaySync"] boolValue] : NO;
+    BOOL configForceSDR = [config[@"forceSDRDisplay"] respondsToSelector:@selector(boolValue)] ? [config[@"forceSDRDisplay"] boolValue] : YES;
+    long long configSpoofFPS = [config[@"spoofMaxFPS"] respondsToSelector:@selector(longLongValue)] ? [config[@"spoofMaxFPS"] longLongValue] : 0;
+
+    self.fps = (NSInteger)ptmc_env_ll("PTMC_FPS", configFPS, 1, 240);
+    self.bitrate = (NSInteger)ptmc_env_ll("PTMC_BITRATE", configBitrate, 1000000, 1000000000);
+    self.bufferCount = (NSInteger)ptmc_env_ll("PTMC_BUFFERS", configBuffers, 3, 16);
+    self.logInterval = ptmc_env_double("PTMC_LOG_INTERVAL", configLogInterval, 0.25, 60.0);
+    self.disableDisplaySync = ptmc_env_bool("PTMC_DISABLE_DISPLAY_SYNC", configDisableDisplaySync);
+    self.forceSDRDisplay = ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", configForceSDR);
+    ptmc_spoof_max_fps = (NSInteger)ptmc_env_ll("PTMC_SPOOF_MAX_FPS", configSpoofFPS, 0, 240);
+
+    const char *statusFile = getenv("PTMC_STATUS_FILE");
+    if (statusFile && *statusFile) {
+        self.statusPath = [[[NSString alloc] initWithUTF8String:statusFile] stringByExpandingTildeInPath];
+    } else {
+        NSString *configuredStatus = [config[@"statusFile"] isKindOfClass:[NSString class]] ? config[@"statusFile"] : nil;
+        self.statusPath = configuredStatus.length > 0 ? [configuredStatus stringByExpandingTildeInPath] : ptmc_default_status_path();
+    }
+}
+
 - (void)start {
+    [self reloadConfiguration];
     atomic_store_explicit(&_requested, true, memory_order_release);
     PTMC_LOG(@"start requested; capture will arm on the next supported drawable");
     ptmc_publish_status(self, self.session, @"requested", @"Waiting for the next supported Metal drawable");
@@ -811,7 +879,6 @@ static atomic_uint ptmc_hook_count;
 static os_unfair_lock ptmc_hook_lock = OS_UNFAIR_LOCK_INIT;
 static atomic_bool ptmc_discovery_scheduled;
 static atomic_bool ptmc_image_scan_pending;
-static NSInteger ptmc_spoof_max_fps = 0;
 static IMP ptmc_max_fps_original = NULL;
 
 static IMP ptmc_original_imp(id self, SEL selector) {
@@ -926,6 +993,7 @@ static void ptmc_discover_runtime_classes(void) {
     SEL s2 = @selector(presentDrawable:atTime:);
     SEL s3 = @selector(presentDrawable:afterMinimumDuration:);
     SEL next = @selector(nextDrawable);
+    SEL setEDR = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
         if (class_conformsToProtocol(cls, protocol)) {
@@ -935,6 +1003,7 @@ static void ptmc_discover_runtime_classes(void) {
         }
         if (ptmc_class_is_subclass_of(cls, metalLayerClass)) {
             installed += ptmc_install_one_hook(cls, next, (IMP)ptmc_next_drawable);
+            installed += ptmc_install_one_hook(cls, setEDR, (IMP)ptmc_set_wants_edr);
         }
     }
     free(classes);
@@ -994,6 +1063,15 @@ static id<CAMetalDrawable> ptmc_next_drawable(CAMetalLayer *self, SEL _cmd) {
     return original ? ((id<CAMetalDrawable> (*)(id, SEL))original)(self, _cmd) : nil;
 }
 
+static void ptmc_set_wants_edr(id self, SEL _cmd, BOOL wantsEDR) {
+    PTMCManager *manager = ptmc_manager();
+    BOOL requested = atomic_load_explicit(&manager->_requested, memory_order_acquire);
+    BOOL effective = (requested && manager.forceSDRDisplay) ? NO : wantsEDR;
+    atomic_store_explicit(&manager->_edr, effective ? 1 : 0, memory_order_relaxed);
+    IMP original = ptmc_original_imp(self, _cmd);
+    if (original) ((void (*)(id, SEL, BOOL))original)(self, _cmd, effective);
+}
+
 static NSInteger ptmc_maximum_frames_per_second(id self, SEL _cmd) {
     if (ptmc_spoof_max_fps > 0) return ptmc_spoof_max_fps;
     return ptmc_max_fps_original ? ((NSInteger (*)(id, SEL))ptmc_max_fps_original)(self, _cmd) : 60;
@@ -1020,18 +1098,19 @@ static void ptmc_control_notification(CFNotificationCenterRef center, void *obse
 }
 
 static void __attribute__((constructor)) ptmc_initialize(void) {
-    BOOL enabled = ptmc_env_bool("PTMC_ENABLE", false);
-    BOOL standby = ptmc_env_bool("PTMC_STANDBY", false);
-    if (!enabled && !standby) return;
+    NSDictionary *config = ptmc_read_runtime_config();
+    BOOL configEnabled = [config[@"enabled"] respondsToSelector:@selector(boolValue)] ? [config[@"enabled"] boolValue] : NO;
+    BOOL configAutostart = [config[@"autostart"] respondsToSelector:@selector(boolValue)] ? [config[@"autostart"] boolValue] : NO;
+    BOOL enabled = ptmc_env_bool("PTMC_ENABLE", configEnabled);
+    BOOL autostart = ptmc_env_bool("PTMC_AUTOSTART", configAutostart);
     atomic_init(&ptmc_hook_count, 0);
     atomic_init(&ptmc_discovery_scheduled, false);
     atomic_init(&ptmc_image_scan_pending, false);
     PTMCManager *manager = ptmc_manager();
-    ptmc_spoof_max_fps = (NSInteger)ptmc_env_ll("PTMC_SPOOF_MAX_FPS", 0, 0, 240);
-    if (ptmc_spoof_max_fps > 0) {
-        Method maxFPS = class_getInstanceMethod([UIScreen class], @selector(maximumFramesPerSecond));
-        if (maxFPS) {
-            ptmc_max_fps_original = method_getImplementation(maxFPS);
+    Method maxFPS = class_getInstanceMethod([UIScreen class], @selector(maximumFramesPerSecond));
+    if (maxFPS) {
+        ptmc_max_fps_original = method_getImplementation(maxFPS);
+        if (ptmc_max_fps_original != (IMP)ptmc_maximum_frames_per_second) {
             method_setImplementation(maxFPS, (IMP)ptmc_maximum_frames_per_second);
         }
     }
@@ -1050,10 +1129,10 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
     }
     _dyld_register_func_for_add_image(ptmc_image_added);
     ptmc_schedule_discovery();
-    PTMC_LOG(@"hooks enabled bundle=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d forceSDR=%d spoofMaxFPS=%ld standby=%d",
+    PTMC_LOG(@"hooks ready bundle=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d forceSDR=%d spoofMaxFPS=%ld enabled=%d",
              bundleIdentifier ?: @"(unknown)",
              (long)manager.fps, (long)manager.bitrate, (long)manager.bufferCount,
-             manager.disableDisplaySync, manager.forceSDRDisplay, (long)ptmc_spoof_max_fps, standby);
-    ptmc_publish_status(manager, nil, @"ready", enabled ? @"PTMC ready" : @"PTMC standing by for a Start command");
-    if (enabled && ptmc_env_bool("PTMC_AUTOSTART", false)) [manager start];
+             manager.disableDisplaySync, manager.forceSDRDisplay, (long)ptmc_spoof_max_fps, enabled);
+    ptmc_publish_status(manager, nil, @"ready", @"PTMC hooks loaded and waiting for capture commands");
+    if (enabled && autostart) [manager start];
 }
