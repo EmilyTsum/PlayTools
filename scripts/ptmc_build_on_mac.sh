@@ -49,7 +49,30 @@ MIN_CATALYST=${PTMC_CATALYST_MIN:-12.0}
 TMPBIN="$BIN.vtool"
 xcrun vtool -set-build-version maccatalyst "$MIN_CATALYST" "$MACOS_SDK" -replace -output "$TMPBIN" "$BIN"
 mv "$TMPBIN" "$BIN"
-codesign --force --deep --sign - "$DIST/PlayTools.framework"
+# Match PlayCover develop's deep macOS framework layout before signing/packaging.
+FRAME="$DIST/PlayTools.framework"
+if [[ ! -d "$FRAME/Versions" ]]; then
+  TMPFRAME="$DIST/.PlayTools.framework.rebundle"
+  rm -rf "$TMPFRAME"
+  mkdir -p "$TMPFRAME/Versions/A/Resources" "$TMPFRAME/Versions/A/Modules" "$TMPFRAME/Versions/A/PlugIns"
+  [[ -f "$FRAME/PlayTools" ]] && cp -p "$FRAME/PlayTools" "$TMPFRAME/Versions/A/PlayTools"
+  [[ -d "$FRAME/Headers" ]] && cp -Rp "$FRAME/Headers" "$TMPFRAME/Versions/A/Headers"
+  [[ -d "$FRAME/Modules" ]] && cp -Rp "$FRAME/Modules"/. "$TMPFRAME/Versions/A/Modules"/
+  [[ -f "$FRAME/Info.plist" ]] && cp -p "$FRAME/Info.plist" "$TMPFRAME/Versions/A/Resources/Info.plist"
+  [[ -d "$FRAME/Resources" ]] && ditto "$FRAME/Resources" "$TMPFRAME/Versions/A/Resources"
+  for lproj in "$FRAME"/*.lproj; do [[ -d "$lproj" ]] && cp -Rp "$lproj" "$TMPFRAME/Versions/A/Resources"/; done
+  [[ -d "$FRAME/PlugIns" ]] && ditto "$FRAME/PlugIns" "$TMPFRAME/Versions/A/PlugIns"
+  ln -s A "$TMPFRAME/Versions/Current"
+  ln -s Versions/Current/Resources "$TMPFRAME/Resources"
+  [[ -d "$TMPFRAME/Versions/A/Headers" ]] && ln -s Versions/Current/Headers "$TMPFRAME/Headers"
+  [[ -d "$TMPFRAME/Versions/A/Modules" ]] && ln -s Versions/Current/Modules "$TMPFRAME/Modules"
+  ln -s Versions/Current/PlayTools "$TMPFRAME/PlayTools"
+  [[ -d "$TMPFRAME/Versions/A/PlugIns" ]] && ln -s Versions/Current/PlugIns "$TMPFRAME/PlugIns"
+  rm -rf "$FRAME"
+  mv "$TMPFRAME" "$FRAME"
+fi
+BIN="$FRAME/PlayTools"
+codesign --force --deep --sign - "$FRAME"
 {
   echo "fork_commit=$(git -C "$ROOT" rev-parse HEAD)"
   echo "upstream_commit=$(git -C "$ROOT" rev-parse upstream/master 2>/dev/null || true)"

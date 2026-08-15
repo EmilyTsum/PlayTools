@@ -13,3 +13,9 @@ The capture path is:
 7. Encoded `CMSampleBuffer`s are muxed without re-encoding through an `AVAssetWriterInput` passthrough input into a QuickTime `.mov`.
 
 The render thread never waits for VideoToolbox or disk. If all fixed slots are busy, capture drops the frame and leaves game rendering alone.
+
+## Hook inheritance and late-loaded classes
+
+The hook table stores the original IMP per concrete class/selector, but replacement lookup walks the receiver's superclass chain. This is necessary when a subclass merely inherits a parent method that PTMC already replaced: the replacement executes with a subclass `self`, yet must call the parent's saved original IMP. PTMC never creates aliases for inherited methods. Dynamic image loads are coalesced through `_dyld_register_func_for_add_image`; runtime class-list discovery is not performed per frame.
+
+VideoToolbox submission and teardown calls are serialized on the per-session encoder queue. Metal completion handlers only enqueue work and never wait for the encoder or disk.

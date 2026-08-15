@@ -2,22 +2,29 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FRAMEWORK=${PTMC_FRAMEWORK:-$ROOT/dist/PlayTools.framework}
-DEST=${PLAYCOVER_APP:-/Applications/PlayCover.app}/Contents/Frameworks/PlayTools.framework
+APP=${PLAYCOVER_APP:-/Applications/PlayCover.app}
+DEST="$APP/Contents/Frameworks/PlayTools.framework"
+BACKUP_ROOT=${PTMC_BACKUP_DIR:-$HOME/Library/Application Support/PlayTools-MetalCapture/backups}
 [[ -d "$FRAMEWORK" ]] || { echo "framework not found: $FRAMEWORK" >&2; exit 2; }
-[[ -d "${PLAYCOVER_APP:-/Applications/PlayCover.app}" ]] || { echo "PlayCover.app not found" >&2; exit 2; }
+[[ -d "$APP" ]] || { echo "PlayCover.app not found: $APP" >&2; exit 2; }
 if pgrep -x PlayCover >/dev/null 2>&1; then
-  echo "PlayCover is running. Quit it before installing to avoid replacing a loaded framework." >&2
+  echo "PlayCover is running. Quit it before installing." >&2
   exit 3
 fi
 STAMP=$(date +%Y%m%d-%H%M%S)
-BACKUP="$DEST.backup-$STAMP"
+mkdir -p "$BACKUP_ROOT"
 if [[ -e "$DEST" ]]; then
-  cp -R "$DEST" "$BACKUP"
+  BACKUP="$BACKUP_ROOT/PlayTools.framework.backup-$STAMP"
+  ditto "$DEST" "$BACKUP"
   echo "Backup: $BACKUP"
 fi
-TMP="$DEST.ptmc-new-$$"
+TMP="$APP/Contents/Frameworks/.PlayTools.framework.ptmc-new-$$"
 rm -rf "$TMP"
-cp -R "$FRAMEWORK" "$TMP"
+ditto "$FRAMEWORK" "$TMP"
+rm -rf "$DEST"
 mv "$TMP" "$DEST"
-codesign --verify --deep --strict "$DEST"
-echo "Installed PTMC PlayTools into PlayCover nightly path: $DEST"
+codesign --force --deep --sign - "$DEST"
+codesign --force --deep --sign - "$APP"
+xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+codesign --verify --deep --strict "$APP"
+echo "Installed PTMC PlayTools: $DEST"
