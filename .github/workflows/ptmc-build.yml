@@ -25,6 +25,10 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           xcrun --sdk macosx --show-sdk-version
+      - name: Compile PTMC Metal kernel
+        run: |
+          python3 tests/extract_ptmc_shader.py > /tmp/PTMCShader.metal
+          xcrun -sdk iphoneos metal -c /tmp/PTMCShader.metal -o /tmp/PTMCShader.air
       - name: Build
         run: PTMC_VERSION=0.1.0 scripts/ptmc_build_on_mac.sh
       - name: Validate

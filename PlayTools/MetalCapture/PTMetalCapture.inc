@@ -67,6 +67,14 @@ static uint64_t ptmc_ticks_to_ns(uint64_t ticks) {
     return (uint64_t)(scaled / info.denom);
 }
 
+static uint64_t ptmc_ns_to_ticks(uint64_t ns) {
+    static mach_timebase_info_data_t info;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&info); });
+    __uint128_t scaled = (__uint128_t)ns * info.denom;
+    return (uint64_t)(scaled / info.numer);
+}
+
 static NSString *ptmc_real_user_home(void) {
     char executablePath[PATH_MAX];
     uint32_t executablePathSize = sizeof(executablePath);
@@ -196,6 +204,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) NSUInteger width;
 @property(nonatomic) NSUInteger height;
 @property(nonatomic) NSInteger fps;
+@property(nonatomic) uint64_t captureIntervalTicks;
 @property(nonatomic) NSInteger bitrate;
 @property(nonatomic, copy) NSString *codecName;
 @property(nonatomic) NSInteger bufferCount;
@@ -246,6 +255,13 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_int_fast64_t _displaySync;
     atomic_int_fast64_t _edr;
     atomic_uint_fast64_t _presentHookCount;
+    atomic_bool _layerNeedsRefresh;
+    BOOL _originalFramebufferOnly;
+    BOOL _originalEDR;
+    BOOL _originalDisplaySync;
+    BOOL _hasOriginalEDR;
+    BOOL _hasOriginalDisplaySync;
+    CGColorSpaceRef _originalColorSpace;
 }
 @property(atomic, strong) PTMCSession *session;
 @property(nonatomic) dispatch_queue_t controlQueue;
@@ -274,6 +290,7 @@ static void ptmc_discover_runtime_classes(void);
 static void ptmc_schedule_discovery(void);
 static void ptmc_update_max_fps_hook(void);
 static void ptmc_uninstall_runtime_hooks(void);
+static void ptmc_restore_capture_layer(PTMCManager *manager);
 static NSInteger ptmc_spoof_max_fps = 0;
 static atomic_bool ptmc_recording_fast = false;
 
@@ -720,6 +737,8 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_drawableWidth, 0); atomic_init(&_drawableHeight, 0); atomic_init(&_pixelFormat, -1);
         atomic_init(&_framebufferOnly, -1); atomic_init(&_displaySync, -1); atomic_init(&_edr, -1);
         atomic_init(&_presentHookCount, 0);
+        atomic_init(&_layerNeedsRefresh, true);
+        _originalColorSpace = NULL;
         [self reloadConfiguration];
     }
     return self;
@@ -754,7 +773,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         codec = @"hevc";
     }
     self.codecName = codec;
-    self.captureLayer = nil;
+    atomic_store_explicit(&_layerNeedsRefresh, true, memory_order_release);
 
     const char *statusFile = getenv("PTMC_STATUS_FILE");
     if (statusFile && *statusFile) {
@@ -777,6 +796,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     atomic_store_explicit(&_droppedUnsupported, 0, memory_order_relaxed);
     atomic_store_explicit(&_skippedRate, 0, memory_order_relaxed);
     self.captureLayer = nil;
+    atomic_store_explicit(&_layerNeedsRefresh, true, memory_order_release);
     atomic_store_explicit(&ptmc_recording_fast, true, memory_order_release);
     ptmc_update_max_fps_hook();
     // Install expensive frame-path hooks only when recording is actually requested. Games that
@@ -790,7 +810,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 - (void)stop {
     atomic_store_explicit(&_requested, false, memory_order_release);
     atomic_store_explicit(&ptmc_recording_fast, false, memory_order_release);
-    self.captureLayer = nil;
+    ptmc_restore_capture_layer(self);
     ptmc_uninstall_runtime_hooks();
     ptmc_spoof_max_fps = 0;
     ptmc_update_max_fps_hook();
@@ -822,7 +842,9 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         }
         PTMCSession *s = [[PTMCSession alloc] init];
         s.generation = atomic_fetch_add_explicit(&self->_generation, 1, memory_order_acq_rel) + 1;
-        s.width = width; s.height = height; s.fps = self.fps; s.bitrate = self.bitrate; s.codecName = self.codecName; s.bufferCount = self.bufferCount;
+        s.width = width; s.height = height; s.fps = self.fps;
+        s.captureIntervalTicks = ptmc_ns_to_ticks(1000000000ull / (uint64_t)MAX(s.fps, 1));
+        s.bitrate = self.bitrate; s.codecName = self.codecName; s.bufferCount = self.bufferCount;
         s.device = device;
         s.encoderQueue = dispatch_queue_create("io.playcover.ptmc.encoder", DISPATCH_QUEUE_SERIAL);
         atomic_init(&s->_accepting, true); atomic_init(&s->_inFlight, 0); atomic_init(&s->_firstTick, 0); atomic_init(&s->_firstHostTime, 0); atomic_init(&s->_lastCaptureTick, 0); atomic_init(&s->_lastPTSUnits, -1);
@@ -859,7 +881,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     }
     if ([texture respondsToSelector:@selector(framebufferOnly)] && texture.framebufferOnly) {
         atomic_fetch_add_explicit(&_droppedUnsupported, 1, memory_order_relaxed);
-        self.captureLayer = nil;
+        atomic_store_explicit(&_layerNeedsRefresh, true, memory_order_release);
         return;
     }
     BOOL sourceSRGB = texture.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB;
@@ -870,15 +892,17 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     // The configured FPS is a real capture-rate ceiling, not just encoder metadata. A 120 Hz
     // game captured at 60 fps now performs roughly half as many BGRA->NV12 conversions/encodes.
     uint64_t lastCapture = atomic_load_explicit(&session->_lastCaptureTick, memory_order_relaxed);
-    uint64_t intervalNs = 1000000000ull / (uint64_t)MAX(session.fps, 1);
-    if (lastCapture != 0 && ptmc_ticks_to_ns(tick - lastCapture) < intervalNs) {
+    if (lastCapture != 0 && tick - lastCapture < session.captureIntervalTicks) {
         atomic_fetch_add_explicit(&_skippedRate, 1, memory_order_relaxed);
         return;
     }
     atomic_store_explicit(&session->_lastCaptureTick, tick, memory_order_relaxed);
-    uint64_t zeroHost = 0;
-    uint64_t hostNow = mach_absolute_time();
-    atomic_compare_exchange_strong_explicit(&session->_firstHostTime, &zeroHost, hostNow, memory_order_acq_rel, memory_order_relaxed);
+    if (atomic_load_explicit(&session->_firstHostTime, memory_order_relaxed) == 0) {
+        uint64_t zeroHost = 0;
+        uint64_t hostNow = mach_absolute_time();
+        atomic_compare_exchange_strong_explicit(&session->_firstHostTime, &zeroHost, hostNow,
+                                                memory_order_acq_rel, memory_order_relaxed);
+    }
     PTMCSlot *slot = ptmc_acquire_slot(session);
     if (!slot) {
         atomic_fetch_add_explicit(&_droppedPool, 1, memory_order_relaxed);
@@ -1113,39 +1137,122 @@ static BOOL ptmc_class_implements_selector(Class cls, SEL selector, Method *meth
     return found;
 }
 
+static void ptmc_call_original_bool_setter(id object, SEL selector, BOOL value) {
+    IMP original = ptmc_original_imp(object, selector);
+    if (original) {
+        ((void (*)(id, SEL, BOOL))original)(object, selector, value);
+    } else if ([object respondsToSelector:selector]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(object, selector, value);
+    }
+}
+
+static void ptmc_call_original_colorspace_setter(CAMetalLayer *layer, CGColorSpaceRef colorSpace) {
+    SEL selector = @selector(setColorspace:);
+    IMP original = ptmc_original_imp(layer, selector);
+    if (original) {
+        ((void (*)(id, SEL, CGColorSpaceRef))original)(layer, selector, colorSpace);
+    } else {
+        layer.colorspace = colorSpace;
+    }
+}
+
+static void ptmc_release_original_colorspace(PTMCManager *manager) {
+    if (manager->_originalColorSpace) {
+        CGColorSpaceRelease(manager->_originalColorSpace);
+        manager->_originalColorSpace = NULL;
+    }
+}
+
+static void ptmc_restore_capture_layer(PTMCManager *manager) {
+    CAMetalLayer *layer = manager.captureLayer;
+    if (!layer) {
+        ptmc_release_original_colorspace(manager);
+        return;
+    }
+
+    ptmc_call_original_bool_setter(layer, @selector(setFramebufferOnly:), manager->_originalFramebufferOnly);
+    SEL syncSetter = NSSelectorFromString(@"setDisplaySyncEnabled:");
+    if (manager->_hasOriginalDisplaySync) {
+        ptmc_call_original_bool_setter(layer, syncSetter, manager->_originalDisplaySync);
+    }
+    SEL edrSetter = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
+    if (manager->_hasOriginalEDR) {
+        ptmc_call_original_bool_setter(layer, edrSetter, manager->_originalEDR);
+    }
+    ptmc_call_original_colorspace_setter(layer, manager->_originalColorSpace);
+
+    manager.captureLayer = nil;
+    manager->_hasOriginalEDR = NO;
+    manager->_hasOriginalDisplaySync = NO;
+    ptmc_release_original_colorspace(manager);
+    atomic_store_explicit(&manager->_layerNeedsRefresh, true, memory_order_release);
+}
+
 static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager) {
-    if (!layer || manager.captureLayer == layer) return;
-    if (layer.framebufferOnly) layer.framebufferOnly = NO;
-    atomic_store_explicit(&manager->_framebufferOnly, layer.framebufferOnly ? 1 : 0, memory_order_relaxed);
+    if (!layer) return;
+    BOOL sameLayer = manager.captureLayer == layer;
+    BOOL refresh = atomic_exchange_explicit(&manager->_layerNeedsRefresh, false, memory_order_acq_rel);
+    if (sameLayer && !refresh) return;
 
     SEL syncGetter = NSSelectorFromString(@"displaySyncEnabled");
     SEL syncSetter = NSSelectorFromString(@"setDisplaySyncEnabled:");
-    if ([layer respondsToSelector:syncGetter]) {
-        BOOL sync = ((BOOL (*)(id, SEL))objc_msgSend)(layer, syncGetter);
-        if (manager.disableDisplaySync && sync && [layer respondsToSelector:syncSetter]) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, syncSetter, NO);
-            sync = NO;
+    SEL edrGetter = NSSelectorFromString(@"wantsExtendedDynamicRangeContent");
+    SEL edrSetter = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
+
+    if (!sameLayer) {
+        if (manager.captureLayer) ptmc_restore_capture_layer(manager);
+        // A game normally owns one CAMetalLayer. Save its presentation state exactly once and
+        // restore it at Stop so merely using PTMC cannot permanently change post-capture pacing/HDR.
+        ptmc_release_original_colorspace(manager);
+        manager->_originalFramebufferOnly = layer.framebufferOnly;
+        manager->_hasOriginalDisplaySync = [layer respondsToSelector:syncGetter];
+        if (manager->_hasOriginalDisplaySync) {
+            manager->_originalDisplaySync = ((BOOL (*)(id, SEL))objc_msgSend)(layer, syncGetter);
         }
-        atomic_store_explicit(&manager->_displaySync, sync ? 1 : 0, memory_order_relaxed);
+        manager->_hasOriginalEDR = [layer respondsToSelector:edrGetter];
+        if (manager->_hasOriginalEDR) {
+            manager->_originalEDR = ((BOOL (*)(id, SEL))objc_msgSend)(layer, edrGetter);
+        }
+        CGColorSpaceRef original = layer.colorspace;
+        if (original) manager->_originalColorSpace = CGColorSpaceRetain(original);
+        manager.captureLayer = layer;
+    }
+
+    if (layer.framebufferOnly) layer.framebufferOnly = NO;
+    atomic_store_explicit(&manager->_framebufferOnly, layer.framebufferOnly ? 1 : 0, memory_order_relaxed);
+
+    if (manager->_hasOriginalDisplaySync && [layer respondsToSelector:syncSetter]) {
+        BOOL desiredSync = manager.disableDisplaySync ? NO : manager->_originalDisplaySync;
+        BOOL currentSync = ((BOOL (*)(id, SEL))objc_msgSend)(layer, syncGetter);
+        if (currentSync != desiredSync) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, syncSetter, desiredSync);
+        }
+        atomic_store_explicit(&manager->_displaySync, desiredSync ? 1 : 0, memory_order_relaxed);
     }
 
     if (manager.forceSDRDisplay) {
-        SEL edrGetter = NSSelectorFromString(@"wantsExtendedDynamicRangeContent");
-        SEL edrSetter = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
-        if ([layer respondsToSelector:edrGetter]) {
-            BOOL edr = ((BOOL (*)(id, SEL))objc_msgSend)(layer, edrGetter);
-            if (edr && [layer respondsToSelector:edrSetter]) {
-                ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, edrSetter, NO);
-                edr = NO;
-            }
-            atomic_store_explicit(&manager->_edr, edr ? 1 : 0, memory_order_relaxed);
+        if (manager->_hasOriginalEDR && [layer respondsToSelector:edrSetter]) {
+            BOOL currentEDR = ((BOOL (*)(id, SEL))objc_msgSend)(layer, edrGetter);
+            if (currentEDR) ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, edrSetter, NO);
+            atomic_store_explicit(&manager->_edr, 0, memory_order_relaxed);
         }
         CGColorSpaceRef sRGB = ptmc_srgb_colorspace();
         CGColorSpaceRef current = layer.colorspace;
         if (sRGB && (!current || !CFEqual(current, sRGB))) layer.colorspace = sRGB;
+    } else {
+        if (manager->_hasOriginalEDR && [layer respondsToSelector:edrSetter]) {
+            BOOL currentEDR = ((BOOL (*)(id, SEL))objc_msgSend)(layer, edrGetter);
+            if (currentEDR != manager->_originalEDR) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, edrSetter, manager->_originalEDR);
+            }
+            atomic_store_explicit(&manager->_edr, manager->_originalEDR ? 1 : 0, memory_order_relaxed);
+        }
+        CGColorSpaceRef current = layer.colorspace;
+        CGColorSpaceRef original = manager->_originalColorSpace;
+        BOOL differs = (current != original) && (!current || !original || !CFEqual(current, original));
+        if (differs) layer.colorspace = original;
     }
     manager.colorSpaceName = ptmc_colorspace_name(layer.colorspace);
-    manager.captureLayer = layer;
 }
 
 static void ptmc_record_present(id commandBuffer, id<CAMetalDrawable> drawable) {
