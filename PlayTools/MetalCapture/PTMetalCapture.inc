@@ -13,6 +13,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <mach/mach_time.h>
 #import <mach-o/dyld.h>
@@ -201,6 +202,8 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_int_fast64_t _lastPTSUnits;
 }
 @property(nonatomic) uint64_t generation;
+@property(nonatomic) NSUInteger sourceWidth;
+@property(nonatomic) NSUInteger sourceHeight;
 @property(nonatomic) NSUInteger width;
 @property(nonatomic) NSUInteger height;
 @property(nonatomic) NSInteger fps;
@@ -211,6 +214,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLComputePipelineState> pipelineBGRA;
 @property(nonatomic, strong) id<MTLComputePipelineState> pipelineSRGB;
+@property(nonatomic, strong) id<MTLComputePipelineState> pipelineScale;
 @property(nonatomic, strong) id<MTLCommandQueue> commandQueue;
 @property(nonatomic, strong) NSArray<PTMCSlot *> *slots;
 @property(nonatomic) CVMetalTextureCacheRef textureCache;
@@ -259,6 +263,7 @@ static NSString *ptmc_output_path_from_environment(void) {
     BOOL _originalFramebufferOnly;
     BOOL _originalEDR;
     BOOL _originalDisplaySync;
+    float _originalOpacity;
     BOOL _hasOriginalEDR;
     BOOL _hasOriginalDisplaySync;
     CGColorSpaceRef _originalColorSpace;
@@ -272,6 +277,10 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) double logInterval;
 @property(nonatomic) BOOL disableDisplaySync;
 @property(nonatomic) BOOL forceSDRDisplay;
+@property(nonatomic) BOOL suppressDisplayOutput;
+@property(nonatomic, copy) NSString *captureResolutionMode;
+@property(nonatomic) NSInteger captureWidth;
+@property(nonatomic) NSInteger captureHeight;
 @property(nonatomic) BOOL captureEnabled;
 @property(atomic, copy) NSString *colorSpaceName;
 @property(atomic, strong) CAMetalLayer *captureLayer;
@@ -327,9 +336,14 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
         status[@"edr"] = @(atomic_load_explicit(&manager->_edr, memory_order_relaxed));
         status[@"presentHookCount"] = @(atomic_load_explicit(&manager->_presentHookCount, memory_order_relaxed));
         status[@"captureEnabled"] = @(manager.captureEnabled);
+        status[@"displaySuppressed"] = @(manager.suppressDisplayOutput);
+        status[@"captureResolutionMode"] = manager.captureResolutionMode ?: @"source";
+        status[@"memoryPath"] = @"Metal -> IOSurface CVPixelBuffer -> VideoToolbox (no CPU readback)";
         if (manager.colorSpaceName.length > 0) status[@"colorSpace"] = manager.colorSpaceName;
         if (session) {
             status[@"generation"] = @(session.generation);
+            status[@"sourceWidth"] = @(session.sourceWidth);
+            status[@"sourceHeight"] = @(session.sourceHeight);
             status[@"width"] = @(session.width);
             status[@"height"] = @(session.height);
             status[@"fps"] = @(session.fps);
@@ -350,6 +364,43 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
             PTMC_LOG(@"status write failed: %@", path);
         }
     });
+}
+
+static NSUInteger ptmc_even_dimension(NSUInteger value) {
+    if (value < 2) return 2;
+    return value & ~((NSUInteger)1);
+}
+
+static void ptmc_resolve_output_size(NSUInteger sourceWidth,
+                                     NSUInteger sourceHeight,
+                                     NSString *mode,
+                                     NSInteger customWidth,
+                                     NSInteger customHeight,
+                                     NSUInteger *outputWidth,
+                                     NSUInteger *outputHeight) {
+    double scale = 1.0;
+    NSString *normalized = mode.lowercaseString ?: @"source";
+    NSInteger preset = 0;
+    if ([normalized isEqualToString:@"2160p"]) preset = 2160;
+    else if ([normalized isEqualToString:@"1440p"]) preset = 1440;
+    else if ([normalized isEqualToString:@"1080p"]) preset = 1080;
+    else if ([normalized isEqualToString:@"720p"]) preset = 720;
+
+    if (preset > 0) {
+        NSUInteger shortEdge = MIN(sourceWidth, sourceHeight);
+        if (shortEdge > (NSUInteger)preset) scale = (double)preset / (double)shortEdge;
+    } else if ([normalized isEqualToString:@"custom"] && customWidth > 0 && customHeight > 0) {
+        double sx = (double)customWidth / (double)MAX(sourceWidth, 1);
+        double sy = (double)customHeight / (double)MAX(sourceHeight, 1);
+        scale = MIN(1.0, MIN(sx, sy));
+    }
+
+    NSUInteger width = ptmc_even_dimension((NSUInteger)floor((double)sourceWidth * scale));
+    NSUInteger height = ptmc_even_dimension((NSUInteger)floor((double)sourceHeight * scale));
+    width = MIN(width, ptmc_even_dimension(sourceWidth));
+    height = MIN(height, ptmc_even_dimension(sourceHeight));
+    if (outputWidth) *outputWidth = width;
+    if (outputHeight) *outputHeight = height;
 }
 
 static const char *ptmc_shader_source =
@@ -398,6 +449,53 @@ static const char *ptmc_shader_source =
     "    float cb = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(-0.114572, -0.385428, 0.5));\n"
     "    float cr = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(0.5, -0.454153, -0.045847));\n"
     "    uvPlane.write(float4(clamp(cb, 0.0, 1.0), clamp(cr, 0.0, 1.0), 0.0, 1.0), cid);\n"
+    "}\n"
+    "\n"
+    "inline float3 sample_rgb(texture2d<float, access::sample> src, sampler smp, float2 uv, bool sourceIsSRGB) {\n"
+    "    float3 rgb = src.sample(smp, uv).rgb;\n"
+    "    return sourceIsSRGB ? linear_to_srgb(rgb) : rgb;\n"
+    "}\n"
+    "\n"
+    "kernel void ptmc_bgra_to_nv12_scaled(texture2d<float, access::sample> src [[texture(0)]],\n"
+    "                                     texture2d<float, access::write> yPlane [[texture(1)]],\n"
+    "                                     texture2d<float, access::write> uvPlane [[texture(2)]],\n"
+    "                                     constant uint &sourceIsSRGB [[buffer(0)]],\n"
+    "                                     uint2 cid [[thread_position_in_grid]]) {\n"
+    "    const uint width = yPlane.get_width();\n"
+    "    const uint height = yPlane.get_height();\n"
+    "    uint2 p0 = cid * 2u;\n"
+    "    if (p0.x >= width || p0.y >= height) return;\n"
+    "    uint2 p1 = uint2(min(p0.x + 1u, width - 1u), p0.y);\n"
+    "    uint2 p2 = uint2(p0.x, min(p0.y + 1u, height - 1u));\n"
+    "    uint2 p3 = uint2(p1.x, p2.y);\n"
+    "    constexpr sampler smp(coord::normalized, address::clamp_to_edge, filter::linear);\n"
+    "    float2 dims = float2(width, height);\n"
+    "    bool srgb = sourceIsSRGB != 0;\n"
+    "    float3 r0 = sample_rgb(src, smp, (float2(p0) + 0.5) / dims, srgb);\n"
+    "    float3 r1 = sample_rgb(src, smp, (float2(p1) + 0.5) / dims, srgb);\n"
+    "    float3 r2 = sample_rgb(src, smp, (float2(p2) + 0.5) / dims, srgb);\n"
+    "    float3 r3 = sample_rgb(src, smp, (float2(p3) + 0.5) / dims, srgb);\n"
+    "    yPlane.write(float4(clamp(luma709(r0), 0.0, 1.0)), p0);\n"
+    "    if (p1.x != p0.x) yPlane.write(float4(clamp(luma709(r1), 0.0, 1.0)), p1);\n"
+    "    if (p2.y != p0.y) yPlane.write(float4(clamp(luma709(r2), 0.0, 1.0)), p2);\n"
+    "    if (p3.x != p0.x && p3.y != p0.y) yPlane.write(float4(clamp(luma709(r3), 0.0, 1.0)), p3);\n"
+    "    float3 avg = (r0 + r1 + r2 + r3) * 0.25;\n"
+    "    float cb = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(-0.114572, -0.385428, 0.5));\n"
+    "    float cr = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(0.5, -0.454153, -0.045847));\n"
+    "    uvPlane.write(float4(clamp(cb, 0.0, 1.0), clamp(cr, 0.0, 1.0), 0.0, 1.0), cid);\n"
+    "}\n"
+    "\n"
+    "kernel void ptmc_bgra_scale_copy(texture2d<float, access::sample> src [[texture(0)]],\n"
+    "                                 texture2d<float, access::write> dst [[texture(1)]],\n"
+    "                                 constant uint &sourceIsSRGB [[buffer(0)]],\n"
+    "                                 uint2 gid [[thread_position_in_grid]]) {\n"
+    "    const uint width = dst.get_width();\n"
+    "    const uint height = dst.get_height();\n"
+    "    if (gid.x >= width || gid.y >= height) return;\n"
+    "    constexpr sampler smp(coord::normalized, address::clamp_to_edge, filter::linear);\n"
+    "    float2 uv = (float2(gid) + 0.5) / float2(width, height);\n"
+    "    float3 rgb = sample_rgb(src, smp, uv, sourceIsSRGB != 0);\n"
+    "    dst.write(float4(rgb, 1.0), gid);\n"
     "}\n"
 ;
 
@@ -704,7 +802,10 @@ static BOOL ptmc_create_slots(PTMCSession *session) {
 }
 
 static BOOL ptmc_create_pipelines(PTMCSession *session) {
-    if (!ptmc_codec_is_hevc(session.codecName)) return YES;
+    BOOL hevc = ptmc_codec_is_hevc(session.codecName);
+    BOOL scaling = session.sourceWidth != session.width || session.sourceHeight != session.height;
+    if (!hevc && !scaling) return YES;
+
     NSError *error = nil;
     NSString *source = [NSString stringWithUTF8String:ptmc_shader_source];
     id<MTLLibrary> library = [session.device newLibraryWithSource:source options:nil error:&error];
@@ -712,15 +813,30 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         PTMC_LOG(@"Metal shader compile failed: %@", error);
         return NO;
     }
-    id<MTLFunction> fn = [library newFunctionWithName:@"ptmc_bgra_to_nv12"];
-    if (!fn) return NO;
-    id<MTLComputePipelineState> pipeline = [session.device newComputePipelineStateWithFunction:fn error:&error];
-    if (!pipeline) {
-        PTMC_LOG(@"Metal compute pipeline failed: %@", error);
+
+    if (hevc) {
+        NSString *functionName = scaling ? @"ptmc_bgra_to_nv12_scaled" : @"ptmc_bgra_to_nv12";
+        id<MTLFunction> function = [library newFunctionWithName:functionName];
+        if (!function) return NO;
+        id<MTLComputePipelineState> pipeline =
+            [session.device newComputePipelineStateWithFunction:function error:&error];
+        if (!pipeline) {
+            PTMC_LOG(@"Metal HEVC conversion pipeline failed: %@", error);
+            return NO;
+        }
+        if (scaling) session.pipelineScale = pipeline;
+        else session.pipelineBGRA = pipeline;
+        session.pipelineSRGB = pipeline;
+        return YES;
+    }
+
+    id<MTLFunction> function = [library newFunctionWithName:@"ptmc_bgra_scale_copy"];
+    if (!function) return NO;
+    session.pipelineScale = [session.device newComputePipelineStateWithFunction:function error:&error];
+    if (!session.pipelineScale) {
+        PTMC_LOG(@"Metal ProRes scale pipeline failed: %@", error);
         return NO;
     }
-    session.pipelineBGRA = pipeline;
-    session.pipelineSRGB = pipeline;
     return YES;
 }
 
@@ -753,6 +869,10 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     double configLogInterval = [config[@"logInterval"] respondsToSelector:@selector(doubleValue)] ? [config[@"logInterval"] doubleValue] : 1.0;
     BOOL configDisableDisplaySync = [config[@"disableDisplaySync"] respondsToSelector:@selector(boolValue)] ? [config[@"disableDisplaySync"] boolValue] : NO;
     BOOL configForceSDR = [config[@"forceSDRDisplay"] respondsToSelector:@selector(boolValue)] ? [config[@"forceSDRDisplay"] boolValue] : YES;
+    BOOL configSuppressDisplay = [config[@"suppressDisplayOutput"] respondsToSelector:@selector(boolValue)] ? [config[@"suppressDisplayOutput"] boolValue] : NO;
+    NSString *configResolution = [config[@"resolutionMode"] isKindOfClass:[NSString class]] ? [config[@"resolutionMode"] lowercaseString] : @"source";
+    long long configCaptureWidth = [config[@"captureWidth"] respondsToSelector:@selector(longLongValue)] ? [config[@"captureWidth"] longLongValue] : 1920;
+    long long configCaptureHeight = [config[@"captureHeight"] respondsToSelector:@selector(longLongValue)] ? [config[@"captureHeight"] longLongValue] : 1080;
     long long configSpoofFPS = [config[@"spoofMaxFPS"] respondsToSelector:@selector(longLongValue)] ? [config[@"spoofMaxFPS"] longLongValue] : 0;
     NSString *configCodec = [config[@"codec"] isKindOfClass:[NSString class]] ? [config[@"codec"] lowercaseString] : @"hevc";
 
@@ -763,6 +883,13 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     self.logInterval = ptmc_env_double("PTMC_LOG_INTERVAL", configLogInterval, 0.25, 60.0);
     self.disableDisplaySync = ptmc_env_bool("PTMC_DISABLE_DISPLAY_SYNC", configDisableDisplaySync);
     self.forceSDRDisplay = ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", configForceSDR);
+    self.suppressDisplayOutput = ptmc_env_bool("PTMC_SUPPRESS_DISPLAY", configSuppressDisplay);
+    NSString *resolutionMode = [ptmc_env_string("PTMC_RESOLUTION_MODE", configResolution) lowercaseString];
+    NSSet *allowedResolutions = [NSSet setWithArray:@[@"source", @"2160p", @"1440p", @"1080p", @"720p", @"custom"]];
+    if (![allowedResolutions containsObject:resolutionMode]) resolutionMode = @"source";
+    self.captureResolutionMode = resolutionMode;
+    self.captureWidth = (NSInteger)ptmc_env_ll("PTMC_CAPTURE_WIDTH", configCaptureWidth, 2, 16384);
+    self.captureHeight = (NSInteger)ptmc_env_ll("PTMC_CAPTURE_HEIGHT", configCaptureHeight, 2, 16384);
     ptmc_spoof_max_fps = (NSInteger)ptmc_env_ll("PTMC_SPOOF_MAX_FPS", configSpoofFPS, 0, 240);
     NSString *codec = [ptmc_env_string("PTMC_CODEC", configCodec) lowercaseString];
     if (![codec isEqualToString:@"hevc"] &&
@@ -833,7 +960,10 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     if (!atomic_load_explicit(&_requested, memory_order_acquire) || self.session) return;
     bool expected = false;
     if (!atomic_compare_exchange_strong_explicit(&_preparing, &expected, true, memory_order_acq_rel, memory_order_relaxed)) return;
-    NSUInteger width = texture.width, height = texture.height;
+    NSUInteger sourceWidth = texture.width, sourceHeight = texture.height;
+    NSUInteger width = sourceWidth, height = sourceHeight;
+    ptmc_resolve_output_size(sourceWidth, sourceHeight, self.captureResolutionMode,
+                             self.captureWidth, self.captureHeight, &width, &height);
     id<MTLDevice> device = texture.device;
     dispatch_async(_controlQueue, ^{
         if (!atomic_load_explicit(&self->_requested, memory_order_acquire)) {
@@ -842,6 +972,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         }
         PTMCSession *s = [[PTMCSession alloc] init];
         s.generation = atomic_fetch_add_explicit(&self->_generation, 1, memory_order_acq_rel) + 1;
+        s.sourceWidth = sourceWidth; s.sourceHeight = sourceHeight;
         s.width = width; s.height = height; s.fps = self.fps;
         s.captureIntervalTicks = ptmc_ns_to_ticks(1000000000ull / (uint64_t)MAX(s.fps, 1));
         s.bitrate = self.bitrate; s.codecName = self.codecName; s.bufferCount = self.bufferCount;
@@ -852,8 +983,10 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         BOOL ok = ptmc_create_pipelines(s) && ptmc_create_slots(s) && ptmc_create_video_session(s);
         if (ok && atomic_load_explicit(&self->_requested, memory_order_acquire)) {
             self.session = s;
-            PTMC_LOG(@"capture armed generation=%llu drawable=%lux%lu codec=%@ buffers=%ld output=%@",
-                     (unsigned long long)s.generation, (unsigned long)s.width, (unsigned long)s.height,
+            PTMC_LOG(@"capture armed generation=%llu source=%lux%lu capture=%lux%lu codec=%@ buffers=%ld output=%@",
+                     (unsigned long long)s.generation,
+                     (unsigned long)s.sourceWidth, (unsigned long)s.sourceHeight,
+                     (unsigned long)s.width, (unsigned long)s.height,
                      s.codecName, (long)s.bufferCount, s.outputPath);
             ptmc_publish_status(self, s, @"armed", @"Capture session armed");
         } else {
@@ -871,10 +1004,10 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     PTMCSession *session = self.session;
     if (!session) { [self prepareForTexture:texture]; return; }
     if (!atomic_load_explicit(&session->_accepting, memory_order_acquire)) return;
-    if (texture.width != session.width || texture.height != session.height) {
+    if (texture.width != session.sourceWidth || texture.height != session.sourceHeight) {
         atomic_fetch_add_explicit(&_droppedUnsupported, 1, memory_order_relaxed);
         PTMC_LOG(@"drawable size changed %lux%lu -> %lux%lu; stopping safely (restart capture to re-arm)",
-                 (unsigned long)session.width, (unsigned long)session.height,
+                 (unsigned long)session.sourceWidth, (unsigned long)session.sourceHeight,
                  (unsigned long)texture.width, (unsigned long)texture.height);
         [self stop];
         return;
@@ -922,28 +1055,51 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
         return;
     }
+    BOOL scaling = session.sourceWidth != session.width || session.sourceHeight != session.height;
     if (ptmc_codec_is_hevc(session.codecName)) {
+        id<MTLComputePipelineState> pipeline = scaling ? session.pipelineScale : session.pipelineBGRA;
         id<MTLComputeCommandEncoder> encoder = [activeCmdBuffer computeCommandEncoder];
-        if (!encoder) {
+        if (!encoder || !pipeline) {
+            [encoder endEncoding];
             ptmc_release_slot(slot);
             atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
             return;
         }
-        [encoder setComputePipelineState:session.pipelineBGRA];
+        [encoder setComputePipelineState:pipeline];
         [encoder setTexture:texture atIndex:0];
         [encoder setTexture:slot.yTexture atIndex:1];
         [encoder setTexture:slot.uvTexture atIndex:2];
         uint32_t srgb = sourceSRGB ? 1 : 0;
         [encoder setBytes:&srgb length:sizeof(srgb) atIndex:0];
-        NSUInteger w = session.pipelineBGRA.threadExecutionWidth;
-        NSUInteger h = MAX(1, session.pipelineBGRA.maxTotalThreadsPerThreadgroup / w);
+        NSUInteger w = pipeline.threadExecutionWidth;
+        NSUInteger h = MAX(1, pipeline.maxTotalThreadsPerThreadgroup / w);
         MTLSize tg = MTLSizeMake(w, MIN(h, 16), 1);
-        MTLSize grid = MTLSizeMake((texture.width + 1) / 2, (texture.height + 1) / 2, 1);
+        MTLSize grid = MTLSizeMake((session.width + 1) / 2, (session.height + 1) / 2, 1);
         [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
         [encoder endEncoding];
+    } else if (scaling) {
+        // Scale directly from the drawable into the IOSurface-backed BGRA encoder buffer. No
+        // intermediate texture and no CPU-visible memcpy/readback are introduced.
+        id<MTLComputeCommandEncoder> encoder = [activeCmdBuffer computeCommandEncoder];
+        if (!encoder || !session.pipelineScale || !slot.bgraTexture) {
+            [encoder endEncoding];
+            ptmc_release_slot(slot);
+            atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
+            return;
+        }
+        [encoder setComputePipelineState:session.pipelineScale];
+        [encoder setTexture:texture atIndex:0];
+        [encoder setTexture:slot.bgraTexture atIndex:1];
+        uint32_t srgb = sourceSRGB ? 1 : 0;
+        [encoder setBytes:&srgb length:sizeof(srgb) atIndex:0];
+        NSUInteger w = session.pipelineScale.threadExecutionWidth;
+        NSUInteger h = MAX(1, session.pipelineScale.maxTotalThreadsPerThreadgroup / w);
+        [encoder dispatchThreads:MTLSizeMake(session.width, session.height, 1)
+           threadsPerThreadgroup:MTLSizeMake(w, MIN(h, 16), 1)];
+        [encoder endEncoding];
     } else {
-        // ProRes can consume BGRA. A direct GPU blit avoids PTMC's full-frame RGB->NV12 compute
-        // pass and leaves color conversion to Apple's hardware video encoder.
+        // Native-size ProRes is the cheapest path: one GPU blit from the drawable into the same
+        // IOSurface-backed CVPixelBuffer that VideoToolbox consumes.
         id<MTLBlitCommandEncoder> blit = [activeCmdBuffer blitCommandEncoder];
         if (!blit || !slot.bgraTexture) {
             [blit endEncoding];
@@ -955,7 +1111,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
                   sourceSlice:0
                   sourceLevel:0
                  sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake(texture.width, texture.height, 1)
+                   sourceSize:MTLSizeMake(session.width, session.height, 1)
                     toTexture:slot.bgraTexture
              destinationSlice:0
              destinationLevel:0
@@ -1031,14 +1187,15 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     uint64_t e = atomic_load_explicit(&_encoded, memory_order_relaxed);
     uint64_t lp = atomic_exchange_explicit(&_lastLogPresented, p, memory_order_acq_rel);
     uint64_t le = atomic_exchange_explicit(&_lastLogEncoded, e, memory_order_acq_rel);
-    PTMC_LOG(@"present=%.2f fps drawable=%llux%llu pixelFormat=%lld displaySync=%lld framebufferOnly=%lld captured=%llu encoded=%.2f fps dropped_pool=%llu dropped_encoder=%llu dropped_late=%llu unsupported=%llu skipped_rate=%llu codec=%@ requested=%d",
+    PTMC_LOG(@"present=%.2f fps drawable=%llux%llu pixelFormat=%lld displaySync=%lld framebufferOnly=%lld captured=%llu encoded=%.2f fps dropped_pool=%llu dropped_encoder=%llu dropped_late=%llu unsupported=%llu skipped_rate=%llu codec=%@ resolution=%@ suppressDisplay=%d requested=%d",
              (p - lp) / seconds,
              (unsigned long long)atomic_load(&_drawableWidth), (unsigned long long)atomic_load(&_drawableHeight),
              (long long)atomic_load(&_pixelFormat), (long long)atomic_load(&_displaySync), (long long)atomic_load(&_framebufferOnly),
              (unsigned long long)atomic_load(&_captured), (e - le) / seconds,
              (unsigned long long)atomic_load(&_droppedPool), (unsigned long long)atomic_load(&_droppedEncoder),
              (unsigned long long)atomic_load(&_droppedLate), (unsigned long long)atomic_load(&_droppedUnsupported),
-             (unsigned long long)atomic_load(&_skippedRate), self.codecName ?: @"hevc", atomic_load(&_requested));
+             (unsigned long long)atomic_load(&_skippedRate), self.codecName ?: @"hevc",
+             self.captureResolutionMode ?: @"source", self.suppressDisplayOutput, atomic_load(&_requested));
     BOOL requested = atomic_load_explicit(&_requested, memory_order_acquire);
     if (force || requested) {
         PTMCSession *session = self.session;
@@ -1180,6 +1337,10 @@ static void ptmc_restore_capture_layer(PTMCManager *manager) {
         ptmc_call_original_bool_setter(layer, edrSetter, manager->_originalEDR);
     }
     ptmc_call_original_colorspace_setter(layer, manager->_originalColorSpace);
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    layer.opacity = manager->_originalOpacity;
+    [CATransaction commit];
 
     manager.captureLayer = nil;
     manager->_hasOriginalEDR = NO;
@@ -1205,6 +1366,7 @@ static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager
         // restore it at Stop so merely using PTMC cannot permanently change post-capture pacing/HDR.
         ptmc_release_original_colorspace(manager);
         manager->_originalFramebufferOnly = layer.framebufferOnly;
+        manager->_originalOpacity = layer.opacity;
         manager->_hasOriginalDisplaySync = [layer respondsToSelector:syncGetter];
         if (manager->_hasOriginalDisplaySync) {
             manager->_originalDisplaySync = ((BOOL (*)(id, SEL))objc_msgSend)(layer, syncGetter);
@@ -1251,6 +1413,16 @@ static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager
         CGColorSpaceRef original = manager->_originalColorSpace;
         BOOL differs = (current != original) && (!current || !original || !CFEqual(current, original));
         if (differs) layer.colorspace = original;
+    }
+    float desiredOpacity = manager.suppressDisplayOutput ? 0.0f : manager->_originalOpacity;
+    if (fabsf(layer.opacity - desiredOpacity) > 0.0001f) {
+        // Keep calling present so CAMetalDrawable objects recycle normally. Making the layer fully
+        // transparent is the safe optional "capture-only" mode; WindowServer may cull the visible
+        // composition without risking nextDrawable starvation.
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        layer.opacity = desiredOpacity;
+        [CATransaction commit];
     }
     manager.colorSpaceName = ptmc_colorspace_name(layer.colorspace);
 }
