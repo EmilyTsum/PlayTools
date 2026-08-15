@@ -80,3 +80,7 @@ grep -q 'developerHUDProperties' "$INC"
 grep -q 'metalHUDSuppressed' "$INC"
 grep -q 'start requested while already recording' "$INC"
 grep -q 's.commandQueue = \[device newCommandQueue\]' "$INC"
+
+! grep -q 'PTMCFrameContext' "$INC"
+grep -q 'slot.session = session' "$INC"
+grep -q 'frameRefCon = (__bridge void \*)slot' "$INC"

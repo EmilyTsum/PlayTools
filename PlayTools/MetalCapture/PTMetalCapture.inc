@@ -161,6 +161,8 @@ static NSString *ptmc_output_path_from_environment(void) {
     return ptmc_timestamped_output_path(directory);
 }
 
+@class PTMCSession;
+
 @interface PTMCSlot : NSObject {
 @public
     CVPixelBufferRef pixelBuffer;
@@ -172,6 +174,8 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic, strong) id<MTLTexture> yTexture;
 @property(nonatomic, strong) id<MTLTexture> uvTexture;
 @property(nonatomic, strong) id<MTLTexture> bgraTexture;
+@property(nonatomic, weak) PTMCSession *session;
+@property(nonatomic) uint64_t generation;
 @end
 
 @implementation PTMCSlot
@@ -182,15 +186,6 @@ static NSString *ptmc_output_path_from_environment(void) {
     if (pixelBuffer) CVPixelBufferRelease(pixelBuffer);
 }
 @end
-
-@class PTMCSession;
-
-@interface PTMCFrameContext : NSObject
-@property(nonatomic, strong) PTMCSession *session;
-@property(nonatomic, strong) PTMCSlot *slot;
-@property(nonatomic) uint64_t generation;
-@end
-@implementation PTMCFrameContext @end
 
 @interface PTMCSession : NSObject {
 @public
@@ -667,10 +662,10 @@ static void ptmc_vt_output_callback(void *outputCallbackRefCon,
                                     VTEncodeInfoFlags infoFlags,
                                     CMSampleBufferRef sampleBuffer) {
     (void)outputCallbackRefCon;
-    PTMCFrameContext *ctx = (__bridge_transfer PTMCFrameContext *)sourceFrameRefCon;
-    PTMCSession *session = ctx.session;
-    PTMCSlot *slot = ctx.slot;
-    if (!session || !slot) return;
+    if (!sourceFrameRefCon) return;
+    PTMCSlot *slot = (__bridge PTMCSlot *)sourceFrameRefCon;
+    PTMCSession *session = slot.session;
+    if (!session || slot.generation != session.generation) return;
 
     // VideoToolbox has finished consuming the IOSurface input by the time this callback fires.
     // Release the scarce capture slot immediately; AVAssetWriter can continue asynchronously with
@@ -835,6 +830,8 @@ static BOOL ptmc_create_slots(PTMCSession *session) {
                               kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
         PTMCSlot *slot = [[PTMCSlot alloc] init];
         slot->pixelBuffer = pb;
+        slot.session = session;
+        slot.generation = session.generation;
         atomic_init(&slot->inUse, false);
         if (hevc) {
             rv = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, NULL,
@@ -1328,14 +1325,14 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
                 atomic_fetch_add_explicit(&self->_droppedLate, 1, memory_order_relaxed);
                 return;
             }
-            PTMCFrameContext *ctx = [[PTMCFrameContext alloc] init];
-            ctx.session = session; ctx.slot = slot; ctx.generation = generation;
             VTEncodeInfoFlags flags = 0;
-            void *frameRefCon = (__bridge_retained void *)ctx;
+            // Slot/session callback metadata is preallocated with the IOSurface ring. The slot cannot
+            // be reused until VideoToolbox calls us back, so no per-frame context allocation/retain is
+            // needed here.
+            void *frameRefCon = (__bridge void *)slot;
             OSStatus err = VTCompressionSessionEncodeFrame(session.compressionSession, slot->pixelBuffer, pts, duration,
                                                             NULL, frameRefCon, &flags);
             if (err != noErr) {
-                CFRelease((CFTypeRef)frameRefCon);
                 ptmc_release_slot(slot);
                 atomic_fetch_sub_explicit(&session->_inFlight, 1, memory_order_acq_rel);
                 atomic_fetch_add_explicit(&self->_droppedEncoder, 1, memory_order_relaxed);
