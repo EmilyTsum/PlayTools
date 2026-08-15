@@ -853,8 +853,12 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
              (unsigned long long)atomic_load(&_droppedPool), (unsigned long long)atomic_load(&_droppedEncoder),
              (unsigned long long)atomic_load(&_droppedLate), (unsigned long long)atomic_load(&_droppedUnsupported),
              atomic_load(&_requested));
-    if (atomic_load_explicit(&_requested, memory_order_acquire)) {
-        ptmc_publish_status(self, self.session, @"active", @"Capture status updated");
+    BOOL requested = atomic_load_explicit(&_requested, memory_order_acquire);
+    if (force || requested) {
+        PTMCSession *session = self.session;
+        NSString *phase = !requested ? @"ready" : (session ? (session.writer ? @"recording" : @"armed") : @"requested");
+        NSString *message = !requested ? @"PTMC hooks loaded and waiting for capture commands" : @"Capture heartbeat updated";
+        ptmc_publish_status(self, session, phase, message);
     }
 }
 @end
