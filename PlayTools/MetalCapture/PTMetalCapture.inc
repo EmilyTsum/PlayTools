@@ -270,6 +270,7 @@ static void ptmc_discover_runtime_classes(void);
 static void ptmc_schedule_discovery(void);
 static void ptmc_update_max_fps_hook(void);
 static NSInteger ptmc_spoof_max_fps = 0;
+static atomic_bool ptmc_recording_fast = false;
 
 static dispatch_queue_t ptmc_status_queue(void) {
     static dispatch_queue_t queue;
@@ -730,6 +731,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 - (void)start {
     [self reloadConfiguration];
     atomic_store_explicit(&_requested, true, memory_order_release);
+    atomic_store_explicit(&ptmc_recording_fast, true, memory_order_release);
     ptmc_update_max_fps_hook();
     // Install expensive frame-path hooks only when recording is actually requested. Games that
     // never record now run with their original Metal dispatch untouched.
@@ -741,6 +743,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 
 - (void)stop {
     atomic_store_explicit(&_requested, false, memory_order_release);
+    atomic_store_explicit(&ptmc_recording_fast, false, memory_order_release);
     ptmc_spoof_max_fps = 0;
     ptmc_update_max_fps_hook();
     PTMCSession *session = self.session;
@@ -1032,8 +1035,8 @@ static BOOL ptmc_class_implements_selector(Class cls, SEL selector, Method *meth
 }
 
 static void ptmc_record_present(id commandBuffer, id<CAMetalDrawable> drawable) {
+    if (!atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire)) return;
     PTMCManager *manager = ptmc_manager();
-    if (!atomic_load_explicit(&manager->_requested, memory_order_acquire)) return;
     uint64_t tick = mach_continuous_time();
     atomic_fetch_add_explicit(&manager->_presented, 1, memory_order_relaxed);
     id<MTLTexture> texture = drawable.texture;
@@ -1278,9 +1281,9 @@ static void ptmc_observe_and_normalize_layer(CAMetalLayer *layer, PTMCManager *m
 }
 
 static id<CAMetalDrawable> ptmc_next_drawable(CAMetalLayer *self, SEL _cmd) {
-    PTMCManager *manager = ptmc_manager();
-    BOOL requested = atomic_load_explicit(&manager->_requested, memory_order_acquire);
+    BOOL requested = atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire);
     if (requested) {
+        PTMCManager *manager = ptmc_manager();
         ptmc_observe_and_normalize_layer(self, manager);
         if (self.framebufferOnly) self.framebufferOnly = NO;
         if (manager.disableDisplaySync) {
@@ -1299,18 +1302,20 @@ static id<CAMetalDrawable> ptmc_next_drawable(CAMetalLayer *self, SEL _cmd) {
 }
 
 static void ptmc_set_wants_edr(id self, SEL _cmd, BOOL wantsEDR) {
-    PTMCManager *manager = ptmc_manager();
-    BOOL effective = ptmc_should_force_sdr(manager) ? NO : wantsEDR;
-    atomic_store_explicit(&manager->_edr, effective ? 1 : 0, memory_order_relaxed);
+    BOOL recording = atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire);
+    PTMCManager *manager = recording ? ptmc_manager() : nil;
+    BOOL effective = manager && ptmc_should_force_sdr(manager) ? NO : wantsEDR;
+    if (manager) atomic_store_explicit(&manager->_edr, effective ? 1 : 0, memory_order_relaxed);
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, BOOL))original)(self, _cmd, effective);
 }
 
 static void ptmc_set_colorspace(id self, SEL _cmd, CGColorSpaceRef colorSpace) {
-    PTMCManager *manager = ptmc_manager();
+    BOOL recording = atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire);
+    PTMCManager *manager = recording ? ptmc_manager() : nil;
     CGColorSpaceRef effective = colorSpace;
-    if (ptmc_should_force_sdr(manager) && ptmc_srgb_colorspace()) effective = ptmc_srgb_colorspace();
-    manager.colorSpaceName = ptmc_colorspace_name(effective);
+    if (manager && ptmc_should_force_sdr(manager) && ptmc_srgb_colorspace()) effective = ptmc_srgb_colorspace();
+    if (manager) manager.colorSpaceName = ptmc_colorspace_name(effective);
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, CGColorSpaceRef))original)(self, _cmd, effective);
 }
@@ -1360,6 +1365,7 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
     BOOL enabled = ptmc_env_bool("PTMC_ENABLE", configEnabled);
     BOOL autostart = ptmc_env_bool("PTMC_AUTOSTART", configAutostart);
     atomic_init(&ptmc_hook_count, 0);
+    atomic_store_explicit(&ptmc_recording_fast, false, memory_order_relaxed);
     atomic_init(&ptmc_discovery_scheduled, false);
     atomic_init(&ptmc_image_scan_pending, false);
     PTMCManager *manager = ptmc_manager();
