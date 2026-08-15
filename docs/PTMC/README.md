@@ -45,7 +45,7 @@ VideoToolbox submission and AVAssetWriter work are isolated on separate serial q
 
 The sampler tracks present cadence. Near the target capture rate it accepts each present to avoid 60 Hz jitter turning into artificial holes. For clearly faster sources it uses deadline sampling. Runtime status exposes present/capture/encode FPS, intentional sampling skips/s, actual drop categories, in-flight/pending counts, and emergency-slot use.
 
-The last user-observed item still requiring hardware proof is rare ~1–2 frame loss around 4K60. CI cannot validate that workload.
+The latest user run reports zero video-frame drops after the jitter/backpressure changes. That is encouraging hardware evidence, but CI still cannot validate sustained 4K60/120 gameplay workloads. The current real-device item to verify is audio continuity after the PlayCover host-side PCM/backlog changes.
 
 ## External fixes carried by this fork
 

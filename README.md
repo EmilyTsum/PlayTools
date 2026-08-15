@@ -181,7 +181,7 @@ To avoid conflicting with the game's own localizable strings, PlayTools' localiz
 
 ## Pre-compositor Metal capture fork
 
-This fork carries an experimental PlayTools Metal Capture (PTMC) path for PlayCover's current GitHub nightly/develop builds. It hooks the game's Metal presentation path before WindowServer composition, performs GPU BGRA→NV12 conversion into an IOSurface-backed fixed ring, and sends frames to VideoToolbox HEVC without full-frame CPU readback.
+This fork carries an experimental PlayTools Metal Capture (PTMC) path for PlayCover's current GitHub nightly/develop builds. It hooks the game's Metal presentation path before WindowServer composition and keeps raw frames on the GPU/IOSurface path without full-frame CPU readback. HEVC uses GPU BGRA→NV12 conversion; ProRes uses IOSurface-backed BGRA copy/scale before VideoToolbox.
 
 Build and package on macOS:
 
