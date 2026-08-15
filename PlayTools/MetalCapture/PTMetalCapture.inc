@@ -9,6 +9,7 @@
 
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -229,6 +230,7 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_int_fast64_t _framebufferOnly;
     atomic_int_fast64_t _displaySync;
     atomic_int_fast64_t _edr;
+    atomic_uint_fast64_t _presentHookCount;
 }
 @property(atomic, strong) PTMCSession *session;
 @property(nonatomic) dispatch_queue_t controlQueue;
@@ -238,6 +240,9 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) double logInterval;
 @property(nonatomic) BOOL disableDisplaySync;
 @property(nonatomic) BOOL forceSDRDisplay;
+@property(nonatomic) BOOL captureEnabled;
+@property(atomic, copy) NSString *colorSpaceName;
+@property(nonatomic, strong) dispatch_source_t heartbeatTimer;
 @property(nonatomic, copy) NSString *statusPath;
 - (void)reloadConfiguration;
 - (void)start;
@@ -279,6 +284,9 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
         status[@"framebufferOnly"] = @(atomic_load_explicit(&manager->_framebufferOnly, memory_order_relaxed));
         status[@"displaySync"] = @(atomic_load_explicit(&manager->_displaySync, memory_order_relaxed));
         status[@"edr"] = @(atomic_load_explicit(&manager->_edr, memory_order_relaxed));
+        status[@"presentHookCount"] = @(atomic_load_explicit(&manager->_presentHookCount, memory_order_relaxed));
+        status[@"captureEnabled"] = @(manager.captureEnabled);
+        if (manager.colorSpaceName.length > 0) status[@"colorSpace"] = manager.colorSpaceName;
         if (session) {
             status[@"generation"] = @(session.generation);
             status[@"width"] = @(session.width);
@@ -643,6 +651,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_lastLogTick, mach_continuous_time()); atomic_init(&_lastLogPresented, 0); atomic_init(&_lastLogEncoded, 0);
         atomic_init(&_drawableWidth, 0); atomic_init(&_drawableHeight, 0); atomic_init(&_pixelFormat, -1);
         atomic_init(&_framebufferOnly, -1); atomic_init(&_displaySync, -1); atomic_init(&_edr, -1);
+        atomic_init(&_presentHookCount, 0);
         [self reloadConfiguration];
     }
     return self;
@@ -650,31 +659,43 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 
 - (void)reloadConfiguration {
     NSDictionary *config = ptmc_read_runtime_config();
-    long long configFPS = [config[@"fps"] respondsToSelector:@selector(longLongValue)] ? [config[@"fps"] longLongValue] : 120;
-    long long configBitrate = [config[@"bitrate"] respondsToSelector:@selector(longLongValue)] ? [config[@"bitrate"] longLongValue] : 120000000;
-    long long configBuffers = [config[@"buffers"] respondsToSelector:@selector(longLongValue)] ? [config[@"buffers"] longLongValue] : 6;
-    double configLogInterval = [config[@"logInterval"] respondsToSelector:@selector(doubleValue)] ? [config[@"logInterval"] doubleValue] : 1.0;
-    BOOL configDisableDisplaySync = [config[@"disableDisplaySync"] respondsToSelector:@selector(boolValue)] ? [config[@"disableDisplaySync"] boolValue] : NO;
-    BOOL configForceSDR = [config[@"forceSDRDisplay"] respondsToSelector:@selector(boolValue)] ? [config[@"forceSDRDisplay"] boolValue] : YES;
-    long long configSpoofFPS = [config[@"spoofMaxFPS"] respondsToSelector:@selector(longLongValue)] ? [config[@"spoofMaxFPS"] longLongValue] : 0;
 
-    self.fps = (NSInteger)ptmc_env_ll("PTMC_FPS", configFPS, 1, 240);
-    self.bitrate = (NSInteger)ptmc_env_ll("PTMC_BITRATE", configBitrate, 1000000, 1000000000);
-    self.bufferCount = (NSInteger)ptmc_env_ll("PTMC_BUFFERS", configBuffers, 3, 16);
-    self.logInterval = ptmc_env_double("PTMC_LOG_INTERVAL", configLogInterval, 0.25, 60.0);
-    self.disableDisplaySync = ptmc_env_bool("PTMC_DISABLE_DISPLAY_SYNC", configDisableDisplaySync);
-    self.forceSDRDisplay = ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", configForceSDR);
-    ptmc_spoof_max_fps = (NSInteger)ptmc_env_ll("PTMC_SPOOF_MAX_FPS", configSpoofFPS, 0, 240);
+    NSNumber *enabledValue = [config[@"enabled"] isKindOfClass:[NSNumber class]] ? config[@"enabled"] : nil;
+    self.captureEnabled = enabledValue ? enabledValue.boolValue : ptmc_env_bool("PTMC_ENABLE", false);
 
-    const char *statusFile = getenv("PTMC_STATUS_FILE");
-    if (statusFile && *statusFile) {
-        self.statusPath = [[[NSString alloc] initWithUTF8String:statusFile] stringByExpandingTildeInPath];
+    NSNumber *fpsValue = [config[@"fps"] isKindOfClass:[NSNumber class]] ? config[@"fps"] : nil;
+    NSNumber *bitrateValue = [config[@"bitrate"] isKindOfClass:[NSNumber class]] ? config[@"bitrate"] : nil;
+    NSNumber *buffersValue = [config[@"buffers"] isKindOfClass:[NSNumber class]] ? config[@"buffers"] : nil;
+    NSNumber *logValue = [config[@"logInterval"] isKindOfClass:[NSNumber class]] ? config[@"logInterval"] : nil;
+    NSNumber *displaySyncValue = [config[@"disableDisplaySync"] isKindOfClass:[NSNumber class]] ? config[@"disableDisplaySync"] : nil;
+    NSNumber *forceSDRValue = [config[@"forceSDRDisplay"] isKindOfClass:[NSNumber class]] ? config[@"forceSDRDisplay"] : nil;
+    NSNumber *spoofValue = [config[@"spoofMaxFPS"] isKindOfClass:[NSNumber class]] ? config[@"spoofMaxFPS"] : nil;
+
+    self.fps = fpsValue ? MAX(1, MIN(240, fpsValue.integerValue))
+                        : (NSInteger)ptmc_env_ll("PTMC_FPS", 120, 1, 240);
+    self.bitrate = bitrateValue ? MAX(1000000, MIN(1000000000, bitrateValue.integerValue))
+                                : (NSInteger)ptmc_env_ll("PTMC_BITRATE", 120000000, 1000000, 1000000000);
+    self.bufferCount = buffersValue ? MAX(3, MIN(16, buffersValue.integerValue))
+                                    : (NSInteger)ptmc_env_ll("PTMC_BUFFERS", 6, 3, 16);
+    self.logInterval = logValue ? MAX(0.25, MIN(60.0, logValue.doubleValue))
+                                : ptmc_env_double("PTMC_LOG_INTERVAL", 1.0, 0.25, 60.0);
+    self.disableDisplaySync = displaySyncValue ? displaySyncValue.boolValue
+                                               : ptmc_env_bool("PTMC_DISABLE_DISPLAY_SYNC", false);
+    self.forceSDRDisplay = forceSDRValue ? forceSDRValue.boolValue
+                                         : ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", true);
+    ptmc_spoof_max_fps = spoofValue ? MAX(0, MIN(240, spoofValue.integerValue))
+                                    : (NSInteger)ptmc_env_ll("PTMC_SPOOF_MAX_FPS", 0, 0, 240);
+
+    NSString *configuredStatus = [config[@"statusFile"] isKindOfClass:[NSString class]] ? config[@"statusFile"] : nil;
+    if (configuredStatus.length > 0) {
+        self.statusPath = [configuredStatus stringByExpandingTildeInPath];
     } else {
-        NSString *configuredStatus = [config[@"statusFile"] isKindOfClass:[NSString class]] ? config[@"statusFile"] : nil;
-        self.statusPath = configuredStatus.length > 0 ? [configuredStatus stringByExpandingTildeInPath] : ptmc_default_status_path();
+        const char *statusFile = getenv("PTMC_STATUS_FILE");
+        self.statusPath = statusFile && *statusFile
+            ? [[[NSString alloc] initWithUTF8String:statusFile] stringByExpandingTildeInPath]
+            : ptmc_default_status_path();
     }
 }
-
 - (void)start {
     [self reloadConfiguration];
     atomic_store_explicit(&_requested, true, memory_order_release);
@@ -870,6 +891,21 @@ static PTMCManager *ptmc_manager(void) {
     return manager;
 }
 
+static CGColorSpaceRef ptmc_srgb_colorspace(void) {
+    static CGColorSpaceRef colorSpace;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    });
+    return colorSpace;
+}
+
+static NSString *ptmc_colorspace_name(CGColorSpaceRef colorSpace) {
+    if (!colorSpace) return @"(none)";
+    CFStringRef name = CGColorSpaceGetName(colorSpace);
+    return name ? [(__bridge NSString *)name copy] : @"(unnamed)";
+}
+
 // ----- Runtime hooks -------------------------------------------------------
 
 typedef struct {
@@ -948,8 +984,16 @@ static void ptmc_present_drawable_after_duration(id self, SEL _cmd, id<CAMetalDr
 }
 
 static BOOL ptmc_install_one_hook(Class cls, SEL selector, IMP replacement) {
+    Method resolvedMethod = class_getInstanceMethod(cls, selector);
+    if (!resolvedMethod) return NO;
+
     Method ownMethod = NULL;
-    if (!ptmc_class_implements_selector(cls, selector, &ownMethod) || !ownMethod) return NO;
+    BOOL declaresMethod = ptmc_class_implements_selector(cls, selector, &ownMethod) && ownMethod;
+    IMP original = method_getImplementation(resolvedMethod);
+    if (!original || original == replacement) return NO;
+    const char *types = method_getTypeEncoding(resolvedMethod);
+    if (!types) return NO;
+
     os_unfair_lock_lock(&ptmc_hook_lock);
     unsigned count = atomic_load_explicit(&ptmc_hook_count, memory_order_relaxed);
     for (unsigned i = 0; i < count; i++) {
@@ -963,18 +1007,30 @@ static BOOL ptmc_install_one_hook(Class cls, SEL selector, IMP replacement) {
         PTMC_LOG(@"hook table full");
         return NO;
     }
-    IMP original = method_getImplementation(ownMethod);
-    if (original == replacement) {
+
+    // Publish the original IMP before changing dispatch so the replacement can always tail-call it.
+    ptmc_hooks[count] = (PTMCHookEntry){ .cls = cls, .selector = selector, .original = original };
+    atomic_store_explicit(&ptmc_hook_count, count + 1, memory_order_release);
+
+    BOOL installed = YES;
+    if (declaresMethod) {
+        method_setImplementation(ownMethod, replacement);
+    } else {
+        // Real Apple Silicon AGX command-buffer classes conform to MTLCommandBuffer but inherit
+        // presentDrawable:* from _MTLCommandBuffer, which itself does not report protocol
+        // conformance. Add a concrete override so those real submissions are intercepted.
+        installed = class_addMethod(cls, selector, replacement, types);
+    }
+
+    if (!installed) {
+        atomic_store_explicit(&ptmc_hook_count, count, memory_order_release);
         os_unfair_lock_unlock(&ptmc_hook_lock);
         return NO;
     }
-    ptmc_hooks[count] = (PTMCHookEntry){ .cls = cls, .selector = selector, .original = original };
-    atomic_store_explicit(&ptmc_hook_count, count + 1, memory_order_release);
-    method_setImplementation(ownMethod, replacement);
+
     os_unfair_lock_unlock(&ptmc_hook_lock);
     return YES;
 }
-
 static BOOL ptmc_class_is_subclass_of(Class cls, Class base) {
     for (Class current = cls; current != Nil; current = class_getSuperclass(current)) {
         if (current == base) return YES;
@@ -983,6 +1039,8 @@ static BOOL ptmc_class_is_subclass_of(Class cls, Class base) {
 }
 
 static id<CAMetalDrawable> ptmc_next_drawable(CAMetalLayer *self, SEL _cmd);
+static void ptmc_set_wants_edr(id self, SEL _cmd, BOOL wantsEDR);
+static void ptmc_set_colorspace(id self, SEL _cmd, CGColorSpaceRef colorSpace);
 
 static void ptmc_discover_runtime_classes(void) {
     int count = objc_getClassList(NULL, 0);
@@ -998,16 +1056,24 @@ static void ptmc_discover_runtime_classes(void) {
     SEL s3 = @selector(presentDrawable:afterMinimumDuration:);
     SEL next = @selector(nextDrawable);
     SEL setEDR = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
+    SEL setColorSpace = @selector(setColorspace:);
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
         if (class_conformsToProtocol(cls, protocol)) {
-            installed += ptmc_install_one_hook(cls, s1, (IMP)ptmc_present_drawable);
-            installed += ptmc_install_one_hook(cls, s2, (IMP)ptmc_present_drawable_at_time);
-            installed += ptmc_install_one_hook(cls, s3, (IMP)ptmc_present_drawable_after_duration);
+            unsigned presentInstalled = 0;
+            presentInstalled += ptmc_install_one_hook(cls, s1, (IMP)ptmc_present_drawable);
+            presentInstalled += ptmc_install_one_hook(cls, s2, (IMP)ptmc_present_drawable_at_time);
+            presentInstalled += ptmc_install_one_hook(cls, s3, (IMP)ptmc_present_drawable_after_duration);
+            if (presentInstalled) {
+                atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, presentInstalled, memory_order_relaxed);
+                PTMC_LOG(@"command-buffer hooks class=%@ installed=%u", NSStringFromClass(cls), presentInstalled);
+                installed += presentInstalled;
+            }
         }
         if (ptmc_class_is_subclass_of(cls, metalLayerClass)) {
             installed += ptmc_install_one_hook(cls, next, (IMP)ptmc_next_drawable);
             installed += ptmc_install_one_hook(cls, setEDR, (IMP)ptmc_set_wants_edr);
+            installed += ptmc_install_one_hook(cls, setColorSpace, (IMP)ptmc_set_colorspace);
         }
     }
     free(classes);
@@ -1037,20 +1103,39 @@ static void ptmc_schedule_discovery(void) {
     }
 }
 
+static BOOL ptmc_should_force_sdr(PTMCManager *manager) {
+    return manager.captureEnabled && manager.forceSDRDisplay;
+}
+
+static void ptmc_observe_and_normalize_layer(CAMetalLayer *layer, PTMCManager *manager) {
+    SEL edrGetter = NSSelectorFromString(@"wantsExtendedDynamicRangeContent");
+    SEL edrSetter = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
+    BOOL forceSDR = ptmc_should_force_sdr(manager);
+
+    if ([layer respondsToSelector:edrGetter]) {
+        BOOL edr = ((BOOL (*)(id, SEL))objc_msgSend)(layer, edrGetter);
+        atomic_store_explicit(&manager->_edr, edr ? 1 : 0, memory_order_relaxed);
+        if (forceSDR && edr && [layer respondsToSelector:edrSetter]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, edrSetter, NO);
+            atomic_store_explicit(&manager->_edr, 0, memory_order_relaxed);
+        }
+    }
+
+    CGColorSpaceRef current = layer.colorspace;
+    manager.colorSpaceName = ptmc_colorspace_name(current);
+    CGColorSpaceRef sRGB = ptmc_srgb_colorspace();
+    if (forceSDR && sRGB && (!current || !CGColorSpaceEqualToColorSpace(current, sRGB))) {
+        layer.colorspace = sRGB;
+        manager.colorSpaceName = ptmc_colorspace_name(sRGB);
+    }
+}
+
 static id<CAMetalDrawable> ptmc_next_drawable(CAMetalLayer *self, SEL _cmd) {
     PTMCManager *manager = ptmc_manager();
+    ptmc_observe_and_normalize_layer(self, manager);
+
     BOOL requested = atomic_load_explicit(&manager->_requested, memory_order_acquire);
     if (requested) {
-        SEL edrGetter = NSSelectorFromString(@"wantsExtendedDynamicRangeContent");
-        SEL edrSetter = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
-        if ([self respondsToSelector:edrGetter]) {
-            BOOL edr = ((BOOL (*)(id, SEL))objc_msgSend)(self, edrGetter);
-            atomic_store_explicit(&manager->_edr, edr ? 1 : 0, memory_order_relaxed);
-            if (manager.forceSDRDisplay && edr && [self respondsToSelector:edrSetter]) {
-                ((void (*)(id, SEL, BOOL))objc_msgSend)(self, edrSetter, NO);
-                atomic_store_explicit(&manager->_edr, 0, memory_order_relaxed);
-            }
-        }
         if (self.framebufferOnly) self.framebufferOnly = NO;
         if (manager.disableDisplaySync) {
             SEL setter = NSSelectorFromString(@"setDisplaySyncEnabled:");
@@ -1069,13 +1154,20 @@ static id<CAMetalDrawable> ptmc_next_drawable(CAMetalLayer *self, SEL _cmd) {
 
 static void ptmc_set_wants_edr(id self, SEL _cmd, BOOL wantsEDR) {
     PTMCManager *manager = ptmc_manager();
-    BOOL requested = atomic_load_explicit(&manager->_requested, memory_order_acquire);
-    BOOL effective = (requested && manager.forceSDRDisplay) ? NO : wantsEDR;
+    BOOL effective = ptmc_should_force_sdr(manager) ? NO : wantsEDR;
     atomic_store_explicit(&manager->_edr, effective ? 1 : 0, memory_order_relaxed);
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, BOOL))original)(self, _cmd, effective);
 }
 
+static void ptmc_set_colorspace(id self, SEL _cmd, CGColorSpaceRef colorSpace) {
+    PTMCManager *manager = ptmc_manager();
+    CGColorSpaceRef effective = colorSpace;
+    if (ptmc_should_force_sdr(manager) && ptmc_srgb_colorspace()) effective = ptmc_srgb_colorspace();
+    manager.colorSpaceName = ptmc_colorspace_name(effective);
+    IMP original = ptmc_original_imp(self, _cmd);
+    if (original) ((void (*)(id, SEL, CGColorSpaceRef))original)(self, _cmd, effective);
+}
 static NSInteger ptmc_maximum_frames_per_second(id self, SEL _cmd) {
     if (ptmc_spoof_max_fps > 0) return ptmc_spoof_max_fps;
     return ptmc_max_fps_original ? ((NSInteger (*)(id, SEL))ptmc_max_fps_original)(self, _cmd) : 60;
@@ -1096,6 +1188,7 @@ static void ptmc_control_notification(CFNotificationCenterRef center, void *obse
     if (ptmc_notification_matches(name, CFSTR("io.playcover.ptmc.start"), ptmc_target_start_notification)) [manager start];
     else if (ptmc_notification_matches(name, CFSTR("io.playcover.ptmc.stop"), ptmc_target_stop_notification)) [manager stop];
     else if (ptmc_notification_matches(name, CFSTR("io.playcover.ptmc.status"), ptmc_target_status_notification)) {
+        [manager reloadConfiguration];
         [manager logStatusForce:YES tick:mach_continuous_time()];
         ptmc_discover_runtime_classes();
     }
@@ -1138,5 +1231,20 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
              (long)manager.fps, (long)manager.bitrate, (long)manager.bufferCount,
              manager.disableDisplaySync, manager.forceSDRDisplay, (long)ptmc_spoof_max_fps, enabled);
     ptmc_publish_status(manager, nil, @"ready", @"PTMC hooks loaded and waiting for capture commands");
+    manager.heartbeatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(manager.heartbeatTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                              NSEC_PER_SEC,
+                              100 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(manager.heartbeatTimer, ^{
+        [manager reloadConfiguration];
+        BOOL requested = atomic_load_explicit(&manager->_requested, memory_order_acquire);
+        PTMCSession *session = manager.session;
+        NSString *phase = !requested ? @"ready" : (session ? (session.writer ? @"recording" : @"armed") : @"requested");
+        NSString *message = !requested ? @"PTMC runtime heartbeat" : @"Capture runtime heartbeat";
+        ptmc_publish_status(manager, session, phase, message);
+    });
+    dispatch_resume(manager.heartbeatTimer);
     if (enabled && autostart) [manager start];
 }
