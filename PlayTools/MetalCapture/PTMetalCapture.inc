@@ -77,22 +77,19 @@ static uint64_t ptmc_ns_to_ticks(uint64_t ns) {
 }
 
 static NSString *ptmc_real_user_home(void) {
-    char executablePath[PATH_MAX];
-    uint32_t executablePathSize = sizeof(executablePath);
-    if (_NSGetExecutablePath(executablePath, &executablePathSize) == 0) {
-        static const char marker[] = "/Library/Containers/io.playcover.PlayCover/";
-        char *found = strstr(executablePath, marker);
-        if (found) {
-            size_t length = (size_t)(found - executablePath);
-            if (length > 0 && length < PATH_MAX) {
-                return [[NSString alloc] initWithBytes:executablePath length:length encoding:NSUTF8StringEncoding];
-            }
-        }
+    // Share PlayLoader's getpwuid_r-based account lookup. Sandboxed iOS-on-Mac processes can report
+    // their container Data directory as HOME/NSHomeDirectory, which is not the account home where
+    // PlayCover's shared container lives.
+    char accountHome[PATH_MAX];
+    pt_copyCurrentUserHomeDirectory(accountHome, sizeof(accountHome));
+    if (accountHome[0] != '\0') {
+        return [NSString stringWithUTF8String:accountHome];
     }
+
+    // Last-resort compatibility fallback if account lookup is unavailable.
     NSString *home = NSHomeDirectory();
     NSRange range = [home rangeOfString:@"/Library/Containers/io.playcover.PlayCover"];
-    if (range.location != NSNotFound) return [home substringToIndex:range.location];
-    return home;
+    return range.location != NSNotFound ? [home substringToIndex:range.location] : home;
 }
 
 static NSString *ptmc_shared_container_path(void) {
