@@ -275,6 +275,7 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_uint_fast64_t _ownedCaptureCommandBuffers;
     atomic_uint_fast64_t _lastOwnedCaptureGPUTimeUs;
     atomic_uint_fast64_t _lastOwnedCaptureCompletionUs;
+    atomic_uintptr_t _captureLayerAddress;
     atomic_bool _layerNeedsRefresh;
     BOOL _originalFramebufferOnly;
     BOOL _originalEDR;
@@ -931,6 +932,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_ownedCaptureCommandBuffers, 0);
         atomic_init(&_lastOwnedCaptureGPUTimeUs, 0);
         atomic_init(&_lastOwnedCaptureCompletionUs, 0);
+        atomic_init(&_captureLayerAddress, 0);
         atomic_init(&_layerNeedsRefresh, true);
         _originalColorSpace = NULL;
         _originalHUDProperties = nil;
@@ -1536,6 +1538,7 @@ static void ptmc_apply_hud_capture_policy(CAMetalLayer *layer, PTMCManager *mana
 static void ptmc_restore_capture_layer(PTMCManager *manager) {
     CAMetalLayer *layer = manager.captureLayer;
     if (!layer) {
+        atomic_store_explicit(&manager->_captureLayerAddress, 0, memory_order_release);
         ptmc_release_original_colorspace(manager);
         return;
     }
@@ -1560,6 +1563,7 @@ static void ptmc_restore_capture_layer(PTMCManager *manager) {
     [CATransaction commit];
 
     manager.captureLayer = nil;
+    atomic_store_explicit(&manager->_captureLayerAddress, 0, memory_order_release);
     manager->_hasOriginalEDR = NO;
     manager->_hasOriginalDisplaySync = NO;
     manager->_hasDeveloperHUDProperties = NO;
@@ -1570,7 +1574,9 @@ static void ptmc_restore_capture_layer(PTMCManager *manager) {
 
 static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager) {
     if (!layer) return;
-    BOOL sameLayer = manager.captureLayer == layer;
+    uintptr_t address = (uintptr_t)(__bridge void *)layer;
+    BOOL sameLayer = atomic_load_explicit(&manager->_captureLayerAddress, memory_order_acquire) == address;
+    if (sameLayer && !atomic_load_explicit(&manager->_layerNeedsRefresh, memory_order_acquire)) return;
     BOOL refresh = atomic_exchange_explicit(&manager->_layerNeedsRefresh, false, memory_order_acq_rel);
     if (sameLayer && !refresh) return;
 
@@ -1605,6 +1611,7 @@ static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager
             : nil;
         atomic_store_explicit(&manager->_metalHUDSuppressed, false, memory_order_release);
         manager.captureLayer = layer;
+        atomic_store_explicit(&manager->_captureLayerAddress, address, memory_order_release);
     }
     ptmc_apply_hud_capture_policy(layer, manager);
 
@@ -1660,87 +1667,82 @@ static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager
     manager.colorSpaceName = ptmc_colorspace_name(layer.colorspace);
 }
 
-static void ptmc_record_present(id commandBuffer, id<CAMetalDrawable> drawable) {
-    if (!atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire)) return;
+static BOOL ptmc_record_present(id commandBuffer, id<CAMetalDrawable> drawable) {
+    if (!atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire)) return NO;
     PTMCManager *manager = ptmc_manager();
-    CAMetalLayer *layer = [drawable respondsToSelector:@selector(layer)] ? drawable.layer : nil;
-    ptmc_prepare_capture_layer(layer, manager);
+    ptmc_prepare_capture_layer(drawable.layer, manager);
     uint64_t tick = mach_continuous_time();
     atomic_fetch_add_explicit(&manager->_presented, 1, memory_order_relaxed);
     id<MTLTexture> texture = drawable.texture;
-    if (texture) {
-        atomic_store_explicit(&manager->_drawableWidth, texture.width, memory_order_relaxed);
-        atomic_store_explicit(&manager->_drawableHeight, texture.height, memory_order_relaxed);
-        atomic_store_explicit(&manager->_pixelFormat, texture.pixelFormat, memory_order_relaxed);
-        if (atomic_load_explicit(&manager->_requested, memory_order_acquire)) {
-            [manager captureTexture:texture commandBuffer:(id<MTLCommandBuffer>)commandBuffer tick:tick];
-        }
-    }
-}
-
-static BOOL ptmc_should_skip_display_present(id<CAMetalDrawable> drawable) {
-    PTMCManager *manager = ptmc_manager();
-    if (!manager.skipDisplayPresent || !atomic_load_explicit(&manager->_requested, memory_order_acquire)) return NO;
-    PTMCSession *session = manager.session;
-    if (!session || !atomic_load_explicit(&session->_accepting, memory_order_acquire)) return NO;
-    id<MTLTexture> texture = drawable.texture;
     if (!texture) return NO;
+
+    atomic_store_explicit(&manager->_drawableWidth, texture.width, memory_order_relaxed);
+    atomic_store_explicit(&manager->_drawableHeight, texture.height, memory_order_relaxed);
+    atomic_store_explicit(&manager->_pixelFormat, texture.pixelFormat, memory_order_relaxed);
+    if (atomic_load_explicit(&manager->_requested, memory_order_acquire)) {
+        [manager captureTexture:texture commandBuffer:(id<MTLCommandBuffer>)commandBuffer tick:tick];
+    }
+
+    // Reuse the manager/texture already loaded for capture instead of performing a second drawable
+    // lookup in every present hook. The normal path exits here without touching session state.
+    if (!manager.skipDisplayPresent || !atomic_load_explicit(&manager->_requested, memory_order_acquire)) return NO;
     BOOL supported = texture.pixelFormat == MTLPixelFormatBGRA8Unorm ||
                      texture.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB;
     if (!supported) return NO;
+    PTMCSession *session = manager.session;
+    if (!session || !atomic_load_explicit(&session->_accepting, memory_order_acquire)) return NO;
     atomic_fetch_add_explicit(&manager->_skippedPresents, 1, memory_order_relaxed);
     return YES;
 }
 
 static void ptmc_present_drawable(id self, SEL _cmd, id<CAMetalDrawable> drawable) {
-    if (!atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)) ptmc_record_present(self, drawable);
-    if (ptmc_should_skip_display_present(drawable)) return;
+    BOOL skip = !atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)
+        && ptmc_record_present(self, drawable);
+    if (skip) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id<CAMetalDrawable>))original)(self, _cmd, drawable);
 }
 
 static void ptmc_present_drawable_at_time(id self, SEL _cmd, id<CAMetalDrawable> drawable, CFTimeInterval time) {
-    if (!atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)) ptmc_record_present(self, drawable);
-    if (ptmc_should_skip_display_present(drawable)) return;
+    BOOL skip = !atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)
+        && ptmc_record_present(self, drawable);
+    if (skip) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id<CAMetalDrawable>, CFTimeInterval))original)(self, _cmd, drawable, time);
 }
 
 static void ptmc_present_drawable_after_duration(id self, SEL _cmd, id<CAMetalDrawable> drawable, CFTimeInterval duration) {
-    if (!atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)) ptmc_record_present(self, drawable);
-    if (ptmc_should_skip_display_present(drawable)) return;
+    BOOL skip = !atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)
+        && ptmc_record_present(self, drawable);
+    if (skip) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id<CAMetalDrawable>, CFTimeInterval))original)(self, _cmd, drawable, duration);
 }
 
 static void ptmc_drawable_present(id self, SEL _cmd) {
     id<CAMetalDrawable> drawable = (id<CAMetalDrawable>)self;
-    ptmc_record_present(nil, drawable);
-    if (ptmc_should_skip_display_present(drawable)) return;
+    if (ptmc_record_present(nil, drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL))original)(self, _cmd);
 }
 
 static void ptmc_drawable_present_at_time(id self, SEL _cmd, CFTimeInterval time) {
     id<CAMetalDrawable> drawable = (id<CAMetalDrawable>)self;
-    ptmc_record_present(nil, drawable);
-    if (ptmc_should_skip_display_present(drawable)) return;
+    if (ptmc_record_present(nil, drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, CFTimeInterval))original)(self, _cmd, time);
 }
 
 static void ptmc_drawable_present_after_duration(id self, SEL _cmd, CFTimeInterval duration) {
     id<CAMetalDrawable> drawable = (id<CAMetalDrawable>)self;
-    ptmc_record_present(nil, drawable);
-    if (ptmc_should_skip_display_present(drawable)) return;
+    if (ptmc_record_present(nil, drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, CFTimeInterval))original)(self, _cmd, duration);
 }
 
 static void ptmc_drawable_present_with_options(id self, SEL _cmd, id options) {
     id<CAMetalDrawable> drawable = (id<CAMetalDrawable>)self;
-    ptmc_record_present(nil, drawable);
-    if (ptmc_should_skip_display_present(drawable)) return;
+    if (ptmc_record_present(nil, drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id))original)(self, _cmd, options);
 }
