@@ -42,3 +42,5 @@ grep -q '#include "MetalCapture/PTMetalCapture.inc"' "$ROOT/PlayTools/PlayLoader
 echo 'PTMC static invariants: PASS'
 grep -q 'frame hooks are dormant until Start' "$INC"
 ! grep -q 'ptmc_next_drawable' "$INC"
+grep -q 'cid \* 2u' "$INC"
+grep -q '(texture.width + 1) / 2' "$INC"

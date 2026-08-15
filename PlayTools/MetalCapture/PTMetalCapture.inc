@@ -350,30 +350,37 @@ static const char *ptmc_shader_source =
     "    return sourceIsSRGB ? linear_to_srgb(rgb) : rgb;\n"
     "}\n"
     "\n"
+    "inline float luma709(float3 rgb) {\n"
+    "    return (16.0/255.0) + (219.0/255.0) * dot(rgb, float3(0.2126, 0.7152, 0.0722));\n"
+    "}\n"
+    "\n"
     "kernel void ptmc_bgra_to_nv12(texture2d<float, access::read> src [[texture(0)]],\n"
     "                              texture2d<float, access::write> yPlane [[texture(1)]],\n"
     "                              texture2d<float, access::write> uvPlane [[texture(2)]],\n"
     "                              constant uint &sourceIsSRGB [[buffer(0)]],\n"
-    "                              uint2 gid [[thread_position_in_grid]]) {\n"
+    "                              uint2 cid [[thread_position_in_grid]]) {\n"
     "    const uint width = src.get_width();\n"
     "    const uint height = src.get_height();\n"
-    "    if (gid.x >= width || gid.y >= height) return;\n"
+    "    uint2 p0 = cid * 2u;\n"
+    "    if (p0.x >= width || p0.y >= height) return;\n"
+    "    uint2 p1 = uint2(min(p0.x + 1u, width - 1u), p0.y);\n"
+    "    uint2 p2 = uint2(p0.x, min(p0.y + 1u, height - 1u));\n"
+    "    uint2 p3 = uint2(p1.x, p2.y);\n"
+    "    bool srgb = sourceIsSRGB != 0;\n"
+    "    float3 r0 = load_rgb(src, p0, srgb);\n"
+    "    float3 r1 = load_rgb(src, p1, srgb);\n"
+    "    float3 r2 = load_rgb(src, p2, srgb);\n"
+    "    float3 r3 = load_rgb(src, p3, srgb);\n"
     "\n"
-    "    float3 rgb = load_rgb(src, gid, sourceIsSRGB != 0);\n"
-    "    // BT.709 non-constant-luminance RGB' -> Y'CbCr, video range (16..235 / 16..240).\n"
-    "    float y = (16.0/255.0) + (219.0/255.0) * dot(rgb, float3(0.2126, 0.7152, 0.0722));\n"
-    "    yPlane.write(float4(clamp(y, 0.0, 1.0)), gid);\n"
+    "    yPlane.write(float4(clamp(luma709(r0), 0.0, 1.0)), p0);\n"
+    "    if (p1.x != p0.x) yPlane.write(float4(clamp(luma709(r1), 0.0, 1.0)), p1);\n"
+    "    if (p2.y != p0.y) yPlane.write(float4(clamp(luma709(r2), 0.0, 1.0)), p2);\n"
+    "    if (p3.x != p0.x && p3.y != p0.y) yPlane.write(float4(clamp(luma709(r3), 0.0, 1.0)), p3);\n"
     "\n"
-    "    if (((gid.x | gid.y) & 1u) == 0u) {\n"
-    "        uint2 p1 = uint2(min(gid.x + 1, width - 1), gid.y);\n"
-    "        uint2 p2 = uint2(gid.x, min(gid.y + 1, height - 1));\n"
-    "        uint2 p3 = uint2(min(gid.x + 1, width - 1), min(gid.y + 1, height - 1));\n"
-    "        float3 avg = (rgb + load_rgb(src, p1, sourceIsSRGB != 0) +\n"
-    "                      load_rgb(src, p2, sourceIsSRGB != 0) + load_rgb(src, p3, sourceIsSRGB != 0)) * 0.25;\n"
-    "        float cb = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(-0.114572, -0.385428, 0.5));\n"
-    "        float cr = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(0.5, -0.454153, -0.045847));\n"
-    "        uvPlane.write(float4(clamp(cb, 0.0, 1.0), clamp(cr, 0.0, 1.0), 0.0, 1.0), gid / 2u);\n"
-    "    }\n"
+    "    float3 avg = (r0 + r1 + r2 + r3) * 0.25;\n"
+    "    float cb = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(-0.114572, -0.385428, 0.5));\n"
+    "    float cr = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(0.5, -0.454153, -0.045847));\n"
+    "    uvPlane.write(float4(clamp(cb, 0.0, 1.0), clamp(cr, 0.0, 1.0), 0.0, 1.0), cid);\n"
     "}\n"
 ;
 
@@ -907,7 +914,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         NSUInteger w = session.pipelineBGRA.threadExecutionWidth;
         NSUInteger h = MAX(1, session.pipelineBGRA.maxTotalThreadsPerThreadgroup / w);
         MTLSize tg = MTLSizeMake(w, MIN(h, 16), 1);
-        MTLSize grid = MTLSizeMake(texture.width, texture.height, 1);
+        MTLSize grid = MTLSizeMake((texture.width + 1) / 2, (texture.height + 1) / 2, 1);
         [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
         [encoder endEncoding];
     } else {
