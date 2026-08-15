@@ -198,10 +198,12 @@ Install into an existing PlayCover nightly with backup/rollback support:
 Capture control:
 
 ```sh
-PTMC_FPS=120 PTMC_BITRATE=120000000 ./scripts/ptmc_enable_capture_env.sh
+PTMC_FPS=120 PTMC_BITRATE=120000000 PTMC_OUTPUT_DIR="$HOME/Movies" ./scripts/ptmc_enable_capture_env.sh
 ./scripts/ptmc_control_capture.sh status
 ./scripts/ptmc_control_capture.sh start
 ./scripts/ptmc_control_capture.sh stop
 ```
+
+`PTMC_OUTPUT` selects one exact file path; `PTMC_OUTPUT_DIR` instead creates a fresh timestamped `.mov` for each recording. The custom `EmilyTsum/PlayCover` `ptmc-nightly` fork exposes these settings per game and sends bundle-targeted start/stop/status notifications, so shell scripts are not required for normal use.
 
 Optional frame-pacing probes are `PTMC_DISABLE_DISPLAY_SYNC=1` and `PTMC_SPOOF_MAX_FPS=120`. See `docs/PTMC/`.

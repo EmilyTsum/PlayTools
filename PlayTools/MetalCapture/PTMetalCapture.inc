@@ -78,12 +78,25 @@ static NSString *ptmc_real_user_home(void) {
     return home;
 }
 
-static NSString *ptmc_default_output_path(void) {
+static NSString *ptmc_timestamped_output_path(NSString *directory) {
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-    fmt.dateFormat = @"yyyyMMdd-HHmmss";
+    fmt.dateFormat = @"yyyyMMdd-HHmmss-SSS";
     NSString *stamp = [fmt stringFromDate:[NSDate date]];
-    return [ptmc_real_user_home() stringByAppendingPathComponent:[NSString stringWithFormat:@"Movies/PlayTools-Capture-%@.mov", stamp]];
+    return [directory stringByAppendingPathComponent:[NSString stringWithFormat:@"PlayTools-Capture-%@.mov", stamp]];
+}
+
+static NSString *ptmc_output_path_from_environment(void) {
+    const char *out = getenv("PTMC_OUTPUT");
+    if (out && *out) {
+        return [[[NSString alloc] initWithUTF8String:out] stringByExpandingTildeInPath];
+    }
+    const char *outDir = getenv("PTMC_OUTPUT_DIR");
+    if (outDir && *outDir) {
+        NSString *directory = [[[NSString alloc] initWithUTF8String:outDir] stringByExpandingTildeInPath];
+        return ptmc_timestamped_output_path(directory);
+    }
+    return ptmc_timestamped_output_path([ptmc_real_user_home() stringByAppendingPathComponent:@"Movies"]);
 }
 
 @interface PTMCSlot : NSObject {
@@ -552,8 +565,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         s.device = device;
         s.encoderQueue = dispatch_queue_create("io.playcover.ptmc.encoder", DISPATCH_QUEUE_SERIAL);
         atomic_init(&s->_accepting, true); atomic_init(&s->_inFlight, 0); atomic_init(&s->_firstTick, 0); atomic_init(&s->_lastPTSUnits, -1);
-        const char *out = getenv("PTMC_OUTPUT");
-        s.outputPath = (out && *out) ? [NSString stringWithUTF8String:out] : ptmc_default_output_path();
+        s.outputPath = ptmc_output_path_from_environment();
         BOOL ok = ptmc_create_pipelines(s) && ptmc_create_slots(s) && ptmc_create_video_session(s);
         if (ok && atomic_load_explicit(&self->_requested, memory_order_acquire)) {
             self.session = s;
@@ -888,13 +900,21 @@ static NSInteger ptmc_maximum_frames_per_second(id self, SEL _cmd) {
     return ptmc_max_fps_original ? ((NSInteger (*)(id, SEL))ptmc_max_fps_original)(self, _cmd) : 60;
 }
 
+static CFStringRef ptmc_target_start_notification = NULL;
+static CFStringRef ptmc_target_stop_notification = NULL;
+static CFStringRef ptmc_target_status_notification = NULL;
+
+static BOOL ptmc_notification_matches(CFStringRef name, CFStringRef globalName, CFStringRef targetName) {
+    return CFEqual(name, globalName) || (targetName && CFEqual(name, targetName));
+}
+
 static void ptmc_control_notification(CFNotificationCenterRef center, void *observer, CFStringRef name,
                                       const void *object, CFDictionaryRef userInfo) {
     (void)center; (void)observer; (void)object; (void)userInfo;
     PTMCManager *manager = ptmc_manager();
-    if (CFEqual(name, CFSTR("io.playcover.ptmc.start"))) [manager start];
-    else if (CFEqual(name, CFSTR("io.playcover.ptmc.stop"))) [manager stop];
-    else if (CFEqual(name, CFSTR("io.playcover.ptmc.status"))) {
+    if (ptmc_notification_matches(name, CFSTR("io.playcover.ptmc.start"), ptmc_target_start_notification)) [manager start];
+    else if (ptmc_notification_matches(name, CFSTR("io.playcover.ptmc.stop"), ptmc_target_stop_notification)) [manager stop];
+    else if (ptmc_notification_matches(name, CFSTR("io.playcover.ptmc.status"), ptmc_target_status_notification)) {
         [manager logStatusForce:YES tick:mach_continuous_time()];
         ptmc_discover_runtime_classes();
     }
@@ -918,9 +938,19 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
     CFNotificationCenterAddObserver(darwin, NULL, ptmc_control_notification, CFSTR("io.playcover.ptmc.start"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(darwin, NULL, ptmc_control_notification, CFSTR("io.playcover.ptmc.stop"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(darwin, NULL, ptmc_control_notification, CFSTR("io.playcover.ptmc.status"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
+    if (bundleIdentifier.length > 0) {
+        ptmc_target_start_notification = CFBridgingRetain([NSString stringWithFormat:@"io.playcover.ptmc.start.%@", bundleIdentifier]);
+        ptmc_target_stop_notification = CFBridgingRetain([NSString stringWithFormat:@"io.playcover.ptmc.stop.%@", bundleIdentifier]);
+        ptmc_target_status_notification = CFBridgingRetain([NSString stringWithFormat:@"io.playcover.ptmc.status.%@", bundleIdentifier]);
+        CFNotificationCenterAddObserver(darwin, NULL, ptmc_control_notification, ptmc_target_start_notification, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(darwin, NULL, ptmc_control_notification, ptmc_target_stop_notification, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(darwin, NULL, ptmc_control_notification, ptmc_target_status_notification, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    }
     _dyld_register_func_for_add_image(ptmc_image_added);
     ptmc_schedule_discovery();
-    PTMC_LOG(@"hooks enabled fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d spoofMaxFPS=%ld",
+    PTMC_LOG(@"hooks enabled bundle=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d spoofMaxFPS=%ld",
+             bundleIdentifier ?: @"(unknown)",
              (long)manager.fps, (long)manager.bitrate, (long)manager.bufferCount,
              manager.disableDisplaySync, (long)ptmc_spoof_max_fps);
     if (ptmc_env_bool("PTMC_AUTOSTART", false)) [manager start];

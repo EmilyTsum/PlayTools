@@ -19,3 +19,9 @@ The render thread never waits for VideoToolbox or disk. If all fixed slots are b
 The hook table stores the original IMP per concrete class/selector, but replacement lookup walks the receiver's superclass chain. This is necessary when a subclass merely inherits a parent method that PTMC already replaced: the replacement executes with a subclass `self`, yet must call the parent's saved original IMP. PTMC never creates aliases for inherited methods. Dynamic image loads are coalesced through `_dyld_register_func_for_add_image`; runtime class-list discovery is not performed per frame.
 
 VideoToolbox submission and teardown calls are serialized on the per-session encoder queue. Metal completion handlers only enqueue work and never wait for the encoder or disk.
+
+## Control and output naming
+
+PTMC listens for both global Darwin notifications (`io.playcover.ptmc.start|stop|status`) and bundle-targeted variants (`io.playcover.ptmc.start|stop|status.<bundle-id>`). The custom PlayCover fork uses the targeted form so recording controls for one running game do not affect another PTMC-enabled game.
+
+`PTMC_OUTPUT` remains an exact-file override for scripts and diagnostics. `PTMC_OUTPUT_DIR` creates a new millisecond-timestamped `.mov` inside the selected directory for every recording, which is the mode used by the PlayCover per-game settings UI. If neither variable is set, PTMC writes timestamped captures under the real user's `~/Movies` directory.
