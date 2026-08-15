@@ -149,6 +149,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic, strong) AVAssetWriter *writer;
 @property(nonatomic, strong) AVAssetWriterInput *writerInput;
 @property(nonatomic, copy) NSString *outputPath;
+@property(nonatomic, copy) NSString *writerPath;
 @property(nonatomic) dispatch_queue_t encoderQueue;
 @end
 
@@ -182,6 +183,7 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_int_fast64_t _pixelFormat;
     atomic_int_fast64_t _framebufferOnly;
     atomic_int_fast64_t _displaySync;
+    atomic_int_fast64_t _edr;
 }
 @property(atomic, strong) PTMCSession *session;
 @property(nonatomic) dispatch_queue_t controlQueue;
@@ -190,6 +192,8 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) NSInteger bufferCount;
 @property(nonatomic) double logInterval;
 @property(nonatomic) BOOL disableDisplaySync;
+@property(nonatomic) BOOL forceSDRDisplay;
+@property(nonatomic, copy) NSString *statusPath;
 - (void)start;
 - (void)stop;
 - (void)prepareForTexture:(id<MTLTexture>)texture;
@@ -198,6 +202,55 @@ static NSString *ptmc_output_path_from_environment(void) {
 @end
 
 static PTMCManager *ptmc_manager(void);
+
+static dispatch_queue_t ptmc_status_queue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("io.playcover.ptmc.status", DISPATCH_QUEUE_SERIAL); });
+    return queue;
+}
+
+static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSString *phase, NSString *message) {
+    NSString *path = manager.statusPath;
+    if (path.length == 0) return;
+    dispatch_async(ptmc_status_queue(), ^{
+        NSMutableDictionary *status = [NSMutableDictionary dictionary];
+        status[@"phase"] = phase ?: @"unknown";
+        status[@"message"] = message ?: @"";
+        status[@"timestamp"] = @([[NSDate date] timeIntervalSince1970]);
+        status[@"requested"] = @(atomic_load_explicit(&manager->_requested, memory_order_acquire));
+        status[@"presented"] = @(atomic_load_explicit(&manager->_presented, memory_order_relaxed));
+        status[@"captured"] = @(atomic_load_explicit(&manager->_captured, memory_order_relaxed));
+        status[@"encoded"] = @(atomic_load_explicit(&manager->_encoded, memory_order_relaxed));
+        status[@"droppedPool"] = @(atomic_load_explicit(&manager->_droppedPool, memory_order_relaxed));
+        status[@"droppedEncoder"] = @(atomic_load_explicit(&manager->_droppedEncoder, memory_order_relaxed));
+        status[@"droppedLate"] = @(atomic_load_explicit(&manager->_droppedLate, memory_order_relaxed));
+        status[@"unsupported"] = @(atomic_load_explicit(&manager->_droppedUnsupported, memory_order_relaxed));
+        status[@"drawableWidth"] = @(atomic_load_explicit(&manager->_drawableWidth, memory_order_relaxed));
+        status[@"drawableHeight"] = @(atomic_load_explicit(&manager->_drawableHeight, memory_order_relaxed));
+        status[@"pixelFormat"] = @(atomic_load_explicit(&manager->_pixelFormat, memory_order_relaxed));
+        status[@"framebufferOnly"] = @(atomic_load_explicit(&manager->_framebufferOnly, memory_order_relaxed));
+        status[@"displaySync"] = @(atomic_load_explicit(&manager->_displaySync, memory_order_relaxed));
+        status[@"edr"] = @(atomic_load_explicit(&manager->_edr, memory_order_relaxed));
+        if (session) {
+            status[@"generation"] = @(session.generation);
+            status[@"width"] = @(session.width);
+            status[@"height"] = @(session.height);
+            status[@"fps"] = @(session.fps);
+            status[@"bitrate"] = @(session.bitrate);
+            if (session.outputPath.length > 0) status[@"outputPath"] = session.outputPath;
+        }
+        NSURL *url = [NSURL fileURLWithPath:path];
+        NSError *error = nil;
+        [[NSFileManager defaultManager] createDirectoryAtURL:[url URLByDeletingLastPathComponent]
+                                 withIntermediateDirectories:YES attributes:nil error:&error];
+        if (error) {
+            PTMC_LOG(@"status directory failed: %@", error);
+        } else if (![status writeToFile:path atomically:YES]) {
+            PTMC_LOG(@"status write failed: %@", path);
+        }
+    });
+}
 
 static const char *ptmc_shader_source =
     "#include <metal_stdlib>\n"
@@ -272,11 +325,28 @@ static void ptmc_finalize_session_when_drained(PTMCSession *session) {
         if (writer && writer.status == AVAssetWriterStatusWriting) {
             [writer finishWritingWithCompletionHandler:^{
                 if (writer.status == AVAssetWriterStatusCompleted) {
-                    PTMC_LOG(@"recording finalized: %@", session.outputPath);
+                    NSError *moveError = nil;
+                    NSFileManager *fm = [NSFileManager defaultManager];
+                    NSURL *finalURL = [NSURL fileURLWithPath:session.outputPath];
+                    NSURL *writerURL = [NSURL fileURLWithPath:session.writerPath ?: session.outputPath];
+                    [fm removeItemAtURL:finalURL error:nil];
+                    if (![writerURL isEqual:finalURL] && ![fm moveItemAtURL:writerURL toURL:finalURL error:&moveError]) {
+                        PTMC_LOG(@"recording finalize rename failed: %@", moveError);
+                        ptmc_publish_status(ptmc_manager(), session, @"error", moveError.localizedDescription ?: @"Recording finalize rename failed");
+                    } else {
+                        PTMC_LOG(@"recording finalized: %@", session.outputPath);
+                        ptmc_publish_status(ptmc_manager(), session, @"finalized", @"Recording finalized successfully");
+                    }
                 } else {
                     PTMC_LOG(@"writer finalize failed: %@", writer.error);
+                    ptmc_publish_status(ptmc_manager(), session, @"error", writer.error.localizedDescription ?: @"Writer finalize failed");
                 }
             }];
+        } else if (!writer) {
+            ptmc_publish_status(ptmc_manager(), session, @"stopped", @"No encoded frames were written");
+        } else {
+            NSString *message = writer.error.localizedDescription ?: @"Writer was not in a finalizable state";
+            ptmc_publish_status(ptmc_manager(), session, @"error", message);
         }
     });
 }
@@ -284,17 +354,22 @@ static void ptmc_finalize_session_when_drained(PTMCSession *session) {
 static BOOL ptmc_ensure_writer(PTMCSession *session, CMSampleBufferRef sampleBuffer) {
     if (session.writer) return session.writer.status == AVAssetWriterStatusWriting;
     NSError *error = nil;
-    NSURL *url = [NSURL fileURLWithPath:session.outputPath];
-    [[NSFileManager defaultManager] createDirectoryAtURL:[url URLByDeletingLastPathComponent]
+    NSString *base = [session.outputPath stringByDeletingPathExtension];
+    session.writerPath = [base stringByAppendingString:@".partial.mov"];
+    NSURL *url = [NSURL fileURLWithPath:session.writerPath];
+    NSURL *finalURL = [NSURL fileURLWithPath:session.outputPath];
+    [[NSFileManager defaultManager] createDirectoryAtURL:[finalURL URLByDeletingLastPathComponent]
                              withIntermediateDirectories:YES attributes:nil error:&error];
     if (error) {
         PTMC_LOG(@"cannot create output directory: %@", error);
+        ptmc_publish_status(ptmc_manager(), session, @"error", error.localizedDescription ?: @"Cannot create output directory");
         return NO;
     }
     [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
     AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:url fileType:AVFileTypeQuickTimeMovie error:&error];
     if (!writer) {
         PTMC_LOG(@"AVAssetWriter init failed: %@", error);
+        ptmc_publish_status(ptmc_manager(), session, @"error", error.localizedDescription ?: @"AVAssetWriter initialization failed");
         return NO;
     }
     CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sampleBuffer);
@@ -304,16 +379,19 @@ static BOOL ptmc_ensure_writer(PTMCSession *session, CMSampleBufferRef sampleBuf
     input.expectsMediaDataInRealTime = YES;
     if (![writer canAddInput:input]) {
         PTMC_LOG(@"AVAssetWriter cannot add HEVC passthrough input");
+        ptmc_publish_status(ptmc_manager(), session, @"error", @"AVAssetWriter cannot add HEVC passthrough input");
         return NO;
     }
     [writer addInput:input];
     if (![writer startWriting]) {
         PTMC_LOG(@"AVAssetWriter start failed: %@", writer.error);
+        ptmc_publish_status(ptmc_manager(), session, @"error", writer.error.localizedDescription ?: @"AVAssetWriter failed to start");
         return NO;
     }
     [writer startSessionAtSourceTime:kCMTimeZero];
     session.writer = writer;
     session.writerInput = input;
+    ptmc_publish_status(ptmc_manager(), session, @"recording", @"HEVC writer started");
     return YES;
 }
 
@@ -517,12 +595,15 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_droppedPool, 0); atomic_init(&_droppedEncoder, 0); atomic_init(&_droppedLate, 0); atomic_init(&_droppedUnsupported, 0);
         atomic_init(&_lastLogTick, mach_continuous_time()); atomic_init(&_lastLogPresented, 0); atomic_init(&_lastLogEncoded, 0);
         atomic_init(&_drawableWidth, 0); atomic_init(&_drawableHeight, 0); atomic_init(&_pixelFormat, -1);
-        atomic_init(&_framebufferOnly, -1); atomic_init(&_displaySync, -1);
+        atomic_init(&_framebufferOnly, -1); atomic_init(&_displaySync, -1); atomic_init(&_edr, -1);
         _fps = (NSInteger)ptmc_env_ll("PTMC_FPS", 120, 1, 240);
         _bitrate = (NSInteger)ptmc_env_ll("PTMC_BITRATE", 120000000, 1000000, 1000000000);
         _bufferCount = (NSInteger)ptmc_env_ll("PTMC_BUFFERS", 6, 3, 16);
         _logInterval = ptmc_env_double("PTMC_LOG_INTERVAL", 1.0, 0.25, 60.0);
         _disableDisplaySync = ptmc_env_bool("PTMC_DISABLE_DISPLAY_SYNC", false);
+        _forceSDRDisplay = ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", false);
+        const char *statusFile = getenv("PTMC_STATUS_FILE");
+        if (statusFile && *statusFile) _statusPath = [[[NSString alloc] initWithUTF8String:statusFile] stringByExpandingTildeInPath];
     }
     return self;
 }
@@ -530,6 +611,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 - (void)start {
     atomic_store_explicit(&_requested, true, memory_order_release);
     PTMC_LOG(@"start requested; capture will arm on the next supported drawable");
+    ptmc_publish_status(self, self.session, @"requested", @"Waiting for the next supported Metal drawable");
 }
 
 - (void)stop {
@@ -546,6 +628,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         });
     }
     PTMC_LOG(@"stop requested");
+    ptmc_publish_status(self, session, session ? @"stopping" : @"stopped", session ? @"Finalizing recording" : @"No active capture session");
 }
 
 - (void)prepareForTexture:(id<MTLTexture>)texture {
@@ -572,10 +655,12 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
             PTMC_LOG(@"capture armed generation=%llu drawable=%lux%lu buffers=%ld output=%@",
                      (unsigned long long)s.generation, (unsigned long)s.width, (unsigned long)s.height,
                      (long)s.bufferCount, s.outputPath);
+            ptmc_publish_status(self, s, @"armed", @"Capture session armed");
         } else {
             atomic_store_explicit(&s->_accepting, false, memory_order_release);
             atomic_store_explicit(&self->_requested, false, memory_order_release);
             PTMC_LOG(@"capture prepare failed");
+            ptmc_publish_status(self, s, @"error", @"Capture preparation failed");
         }
         atomic_store_explicit(&self->_preparing, false, memory_order_release);
     });
@@ -700,6 +785,9 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
              (unsigned long long)atomic_load(&_droppedPool), (unsigned long long)atomic_load(&_droppedEncoder),
              (unsigned long long)atomic_load(&_droppedLate), (unsigned long long)atomic_load(&_droppedUnsupported),
              atomic_load(&_requested));
+    if (atomic_load_explicit(&_requested, memory_order_acquire)) {
+        ptmc_publish_status(self, self.session, @"active", @"Capture status updated");
+    }
 }
 @end
 
@@ -755,6 +843,7 @@ static BOOL ptmc_class_implements_selector(Class cls, SEL selector, Method *meth
 
 static void ptmc_record_present(id commandBuffer, id<CAMetalDrawable> drawable) {
     PTMCManager *manager = ptmc_manager();
+    if (!atomic_load_explicit(&manager->_requested, memory_order_acquire)) return;
     uint64_t tick = mach_continuous_time();
     atomic_fetch_add_explicit(&manager->_presented, 1, memory_order_relaxed);
     id<MTLTexture> texture = drawable.texture;
@@ -879,6 +968,16 @@ static id<CAMetalDrawable> ptmc_next_drawable(CAMetalLayer *self, SEL _cmd) {
     PTMCManager *manager = ptmc_manager();
     BOOL requested = atomic_load_explicit(&manager->_requested, memory_order_acquire);
     if (requested) {
+        SEL edrGetter = NSSelectorFromString(@"wantsExtendedDynamicRangeContent");
+        SEL edrSetter = NSSelectorFromString(@"setWantsExtendedDynamicRangeContent:");
+        if ([self respondsToSelector:edrGetter]) {
+            BOOL edr = ((BOOL (*)(id, SEL))objc_msgSend)(self, edrGetter);
+            atomic_store_explicit(&manager->_edr, edr ? 1 : 0, memory_order_relaxed);
+            if (manager.forceSDRDisplay && edr && [self respondsToSelector:edrSetter]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(self, edrSetter, NO);
+                atomic_store_explicit(&manager->_edr, 0, memory_order_relaxed);
+            }
+        }
         if (self.framebufferOnly) self.framebufferOnly = NO;
         if (manager.disableDisplaySync) {
             SEL setter = NSSelectorFromString(@"setDisplaySyncEnabled:");
@@ -921,7 +1020,9 @@ static void ptmc_control_notification(CFNotificationCenterRef center, void *obse
 }
 
 static void __attribute__((constructor)) ptmc_initialize(void) {
-    if (!ptmc_env_bool("PTMC_ENABLE", false)) return;
+    BOOL enabled = ptmc_env_bool("PTMC_ENABLE", false);
+    BOOL standby = ptmc_env_bool("PTMC_STANDBY", false);
+    if (!enabled && !standby) return;
     atomic_init(&ptmc_hook_count, 0);
     atomic_init(&ptmc_discovery_scheduled, false);
     atomic_init(&ptmc_image_scan_pending, false);
@@ -949,9 +1050,10 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
     }
     _dyld_register_func_for_add_image(ptmc_image_added);
     ptmc_schedule_discovery();
-    PTMC_LOG(@"hooks enabled bundle=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d spoofMaxFPS=%ld",
+    PTMC_LOG(@"hooks enabled bundle=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d forceSDR=%d spoofMaxFPS=%ld standby=%d",
              bundleIdentifier ?: @"(unknown)",
              (long)manager.fps, (long)manager.bitrate, (long)manager.bufferCount,
-             manager.disableDisplaySync, (long)ptmc_spoof_max_fps);
-    if (ptmc_env_bool("PTMC_AUTOSTART", false)) [manager start];
+             manager.disableDisplaySync, manager.forceSDRDisplay, (long)ptmc_spoof_max_fps, standby);
+    ptmc_publish_status(manager, nil, @"ready", enabled ? @"PTMC ready" : @"PTMC standing by for a Start command");
+    if (enabled && ptmc_env_bool("PTMC_AUTOSTART", false)) [manager start];
 }
