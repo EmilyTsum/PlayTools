@@ -198,7 +198,8 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_uint_fast64_t _inFlight;
     atomic_uint_fast64_t _firstTick;
     atomic_uint_fast64_t _firstHostTime;
-    atomic_uint_fast64_t _lastCaptureTick;
+    atomic_uint_fast64_t _nextCaptureTick;
+    atomic_uint_fast64_t _pendingWrites;
     atomic_int_fast64_t _lastPTSUnits;
 }
 @property(nonatomic) uint64_t generation;
@@ -224,6 +225,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic, copy) NSString *outputPath;
 @property(nonatomic, copy) NSString *writerPath;
 @property(nonatomic) dispatch_queue_t encoderQueue;
+@property(nonatomic) dispatch_queue_t writerQueue;
 @end
 
 @implementation PTMCSession
@@ -249,6 +251,8 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_uint_fast64_t _droppedLate;
     atomic_uint_fast64_t _droppedUnsupported;
     atomic_uint_fast64_t _skippedRate;
+    atomic_uint_fast64_t _lastLogSkipped;
+    atomic_uint_fast64_t _samplingSkipMilliFPS;
     atomic_uint_fast64_t _lastLogTick;
     atomic_uint_fast64_t _lastLogPresented;
     atomic_uint_fast64_t _lastLogEncoded;
@@ -259,6 +263,10 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_int_fast64_t _displaySync;
     atomic_int_fast64_t _edr;
     atomic_uint_fast64_t _presentHookCount;
+    atomic_uint_fast64_t _skippedPresents;
+    atomic_uint_fast64_t _ownedCaptureCommandBuffers;
+    atomic_uint_fast64_t _lastOwnedCaptureGPUTimeUs;
+    atomic_uint_fast64_t _lastOwnedCaptureCompletionUs;
     atomic_bool _layerNeedsRefresh;
     BOOL _originalFramebufferOnly;
     BOOL _originalEDR;
@@ -278,6 +286,7 @@ static NSString *ptmc_output_path_from_environment(void) {
 @property(nonatomic) BOOL disableDisplaySync;
 @property(nonatomic) BOOL forceSDRDisplay;
 @property(nonatomic) BOOL suppressDisplayOutput;
+@property(nonatomic) BOOL skipDisplayPresent;
 @property(nonatomic, copy) NSString *captureResolutionMode;
 @property(nonatomic) NSInteger captureWidth;
 @property(nonatomic) NSInteger captureHeight;
@@ -326,7 +335,11 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
         status[@"droppedEncoder"] = @(atomic_load_explicit(&manager->_droppedEncoder, memory_order_relaxed));
         status[@"droppedLate"] = @(atomic_load_explicit(&manager->_droppedLate, memory_order_relaxed));
         status[@"unsupported"] = @(atomic_load_explicit(&manager->_droppedUnsupported, memory_order_relaxed));
-        status[@"skippedRate"] = @(atomic_load_explicit(&manager->_skippedRate, memory_order_relaxed));
+        uint64_t samplingSkipped = atomic_load_explicit(&manager->_skippedRate, memory_order_relaxed);
+        status[@"skippedRate"] = @(samplingSkipped); // legacy key
+        status[@"samplingSkipped"] = @(samplingSkipped);
+        status[@"samplingSkipPerSecond"] = @((double)atomic_load_explicit(
+            &manager->_samplingSkipMilliFPS, memory_order_relaxed) / 1000.0);
         status[@"codec"] = manager.codecName ?: @"hevc";
         status[@"drawableWidth"] = @(atomic_load_explicit(&manager->_drawableWidth, memory_order_relaxed));
         status[@"drawableHeight"] = @(atomic_load_explicit(&manager->_drawableHeight, memory_order_relaxed));
@@ -337,6 +350,11 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
         status[@"presentHookCount"] = @(atomic_load_explicit(&manager->_presentHookCount, memory_order_relaxed));
         status[@"captureEnabled"] = @(manager.captureEnabled);
         status[@"displaySuppressed"] = @(manager.suppressDisplayOutput);
+        status[@"displayPresentSkipped"] = @(manager.skipDisplayPresent);
+        status[@"skippedPresents"] = @(atomic_load_explicit(&manager->_skippedPresents, memory_order_relaxed));
+        status[@"ownedCaptureCommandBuffers"] = @(atomic_load_explicit(&manager->_ownedCaptureCommandBuffers, memory_order_relaxed));
+        status[@"lastOwnedCaptureGPUTimeUs"] = @(atomic_load_explicit(&manager->_lastOwnedCaptureGPUTimeUs, memory_order_relaxed));
+        status[@"lastOwnedCaptureCompletionUs"] = @(atomic_load_explicit(&manager->_lastOwnedCaptureCompletionUs, memory_order_relaxed));
         status[@"captureResolutionMode"] = manager.captureResolutionMode ?: @"source";
         status[@"memoryPath"] = @"Metal -> IOSurface CVPixelBuffer -> VideoToolbox (no CPU readback)";
         if (manager.colorSpaceName.length > 0) status[@"colorSpace"] = manager.colorSpaceName;
@@ -347,6 +365,9 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
             status[@"width"] = @(session.width);
             status[@"height"] = @(session.height);
             status[@"fps"] = @(session.fps);
+            status[@"bufferCount"] = @(session.bufferCount);
+            status[@"inFlight"] = @(atomic_load_explicit(&session->_inFlight, memory_order_relaxed));
+            status[@"pendingWrites"] = @(atomic_load_explicit(&session->_pendingWrites, memory_order_relaxed));
             status[@"bitrate"] = @(session.bitrate);
             status[@"codec"] = session.codecName ?: manager.codecName ?: @"hevc";
             uint64_t firstHostTime = atomic_load_explicit(&session->_firstHostTime, memory_order_acquire);
@@ -515,45 +536,43 @@ static PTMCSlot *ptmc_acquire_slot(PTMCSession *session) {
 }
 
 static void ptmc_finalize_session_when_drained(PTMCSession *session) {
-    dispatch_async(session.encoderQueue, ^{
-        if (atomic_load_explicit(&session->_inFlight, memory_order_acquire) != 0) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC), session.encoderQueue, ^{
-                ptmc_finalize_session_when_drained(session);
-            });
-            return;
-        }
-        if (session.compressionSession) {
-            VTCompressionSessionCompleteFrames(session.compressionSession, kCMTimeInvalid);
-        }
-        if (session.writerInput) [session.writerInput markAsFinished];
-        AVAssetWriter *writer = session.writer;
-        if (writer && writer.status == AVAssetWriterStatusWriting) {
-            [writer finishWritingWithCompletionHandler:^{
-                if (writer.status == AVAssetWriterStatusCompleted) {
-                    NSError *moveError = nil;
-                    NSFileManager *fm = [NSFileManager defaultManager];
-                    NSURL *finalURL = [NSURL fileURLWithPath:session.outputPath];
-                    NSURL *writerURL = [NSURL fileURLWithPath:session.writerPath ?: session.outputPath];
-                    [fm removeItemAtURL:finalURL error:nil];
-                    if (![writerURL isEqual:finalURL] && ![fm moveItemAtURL:writerURL toURL:finalURL error:&moveError]) {
-                        PTMC_LOG(@"recording finalize rename failed: %@", moveError);
-                        ptmc_publish_status(ptmc_manager(), session, @"error", moveError.localizedDescription ?: @"Recording finalize rename failed");
-                    } else {
-                        PTMC_LOG(@"recording finalized: %@", session.outputPath);
-                        ptmc_publish_status(ptmc_manager(), session, @"finalized", @"Recording finalized successfully");
-                    }
+    // VideoToolbox input completion and AVAssetWriter output are independent. Finalize only after
+    // both sides have drained; never hold an encoder input slot while waiting for disk I/O.
+    if (atomic_load_explicit(&session->_inFlight, memory_order_acquire) != 0 ||
+        atomic_load_explicit(&session->_pendingWrites, memory_order_acquire) != 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_MSEC), session.writerQueue, ^{
+            ptmc_finalize_session_when_drained(session);
+        });
+        return;
+    }
+    if (session.writerInput) [session.writerInput markAsFinished];
+    AVAssetWriter *writer = session.writer;
+    if (writer && writer.status == AVAssetWriterStatusWriting) {
+        [writer finishWritingWithCompletionHandler:^{
+            if (writer.status == AVAssetWriterStatusCompleted) {
+                NSError *moveError = nil;
+                NSFileManager *fm = [NSFileManager defaultManager];
+                NSURL *finalURL = [NSURL fileURLWithPath:session.outputPath];
+                NSURL *writerURL = [NSURL fileURLWithPath:session.writerPath ?: session.outputPath];
+                [fm removeItemAtURL:finalURL error:nil];
+                if (![writerURL isEqual:finalURL] && ![fm moveItemAtURL:writerURL toURL:finalURL error:&moveError]) {
+                    PTMC_LOG(@"recording finalize rename failed: %@", moveError);
+                    ptmc_publish_status(ptmc_manager(), session, @"error", moveError.localizedDescription ?: @"Recording finalize rename failed");
                 } else {
-                    PTMC_LOG(@"writer finalize failed: %@", writer.error);
-                    ptmc_publish_status(ptmc_manager(), session, @"error", writer.error.localizedDescription ?: @"Writer finalize failed");
+                    PTMC_LOG(@"recording finalized: %@", session.outputPath);
+                    ptmc_publish_status(ptmc_manager(), session, @"finalized", @"Recording finalized successfully");
                 }
-            }];
-        } else if (!writer) {
-            ptmc_publish_status(ptmc_manager(), session, @"stopped", @"No encoded frames were written");
-        } else {
-            NSString *message = writer.error.localizedDescription ?: @"Writer was not in a finalizable state";
-            ptmc_publish_status(ptmc_manager(), session, @"error", message);
-        }
-    });
+            } else {
+                PTMC_LOG(@"writer finalize failed: %@", writer.error);
+                ptmc_publish_status(ptmc_manager(), session, @"error", writer.error.localizedDescription ?: @"Writer finalize failed");
+            }
+        }];
+    } else if (!writer) {
+        ptmc_publish_status(ptmc_manager(), session, @"stopped", @"No encoded frames were written");
+    } else {
+        NSString *message = writer.error.localizedDescription ?: @"Writer was not in a finalizable state";
+        ptmc_publish_status(ptmc_manager(), session, @"error", message);
+    }
 }
 
 static BOOL ptmc_ensure_writer(PTMCSession *session, CMSampleBufferRef sampleBuffer) {
@@ -611,36 +630,44 @@ static void ptmc_vt_output_callback(void *outputCallbackRefCon,
     PTMCSlot *slot = ctx.slot;
     if (!session || !slot) return;
 
+    // VideoToolbox has finished consuming the IOSurface input by the time this callback fires.
+    // Release the scarce capture slot immediately; AVAssetWriter can continue asynchronously with
+    // the compressed CMSampleBuffer and must not extend GPU/encoder backpressure to the render path.
+    BOOL good = status == noErr && sampleBuffer != NULL && !(infoFlags & kVTEncodeInfo_FrameDropped);
     if (sampleBuffer) CFRetain(sampleBuffer);
-    dispatch_async(session.encoderQueue, ^{
+    ptmc_release_slot(slot);
+    atomic_fetch_sub_explicit(&session->_inFlight, 1, memory_order_acq_rel);
+
+    if (!good) {
+        atomic_fetch_add_explicit(&ptmc_manager()->_droppedEncoder, 1, memory_order_relaxed);
+        if (sampleBuffer) CFRelease(sampleBuffer);
+        return;
+    }
+
+    atomic_fetch_add_explicit(&session->_pendingWrites, 1, memory_order_acq_rel);
+    dispatch_async(session.writerQueue, ^{
         PTMCManager *manager = ptmc_manager();
-        BOOL sameGeneration = atomic_load_explicit(&manager->_generation, memory_order_acquire) == ctx.generation;
-        BOOL good = status == noErr && sampleBuffer != NULL && !(infoFlags & kVTEncodeInfo_FrameDropped);
-        if (good && sameGeneration) {
-            if (ptmc_ensure_writer(session, sampleBuffer)) {
-                // Writer backpressure occurs off the render thread. Holding the slot here bounds queued work.
-                int spins = 0;
-                while (!session.writerInput.readyForMoreMediaData && spins < 250 &&
-                       atomic_load_explicit(&session->_accepting, memory_order_acquire)) {
-                    usleep(1000);
-                    spins++;
-                }
-                if (session.writerInput.readyForMoreMediaData && [session.writerInput appendSampleBuffer:sampleBuffer]) {
-                    atomic_fetch_add_explicit(&manager->_encoded, 1, memory_order_relaxed);
-                } else {
-                    atomic_fetch_add_explicit(&manager->_droppedEncoder, 1, memory_order_relaxed);
-                    PTMC_LOG(@"writer backpressure/failure; stopping capture to avoid a corrupt GOP");
-                    [manager stop];
-                }
+        if (ptmc_ensure_writer(session, sampleBuffer)) {
+            // Writer pressure is isolated to this dedicated utility queue. Waiting here cannot
+            // occupy an IOSurface slot, cannot block VideoToolbox submission, and cannot stall the
+            // game's render/present thread. Keep ordering intact by waiting serially for readiness.
+            int waits = 0;
+            while (!session.writerInput.readyForMoreMediaData && waits < 250) {
+                usleep(1000);
+                waits++;
+            }
+            if (session.writerInput.readyForMoreMediaData && [session.writerInput appendSampleBuffer:sampleBuffer]) {
+                atomic_fetch_add_explicit(&manager->_encoded, 1, memory_order_relaxed);
             } else {
                 atomic_fetch_add_explicit(&manager->_droppedEncoder, 1, memory_order_relaxed);
+                PTMC_LOG(@"writer backpressure/failure after asynchronous wait; stopping this capture safely");
+                if (manager.session == session) [manager stop];
             }
-        } else if (sameGeneration) {
+        } else {
             atomic_fetch_add_explicit(&manager->_droppedEncoder, 1, memory_order_relaxed);
         }
         if (sampleBuffer) CFRelease(sampleBuffer);
-        ptmc_release_slot(slot);
-        atomic_fetch_sub_explicit(&session->_inFlight, 1, memory_order_acq_rel);
+        atomic_fetch_sub_explicit(&session->_pendingWrites, 1, memory_order_acq_rel);
     });
 }
 
@@ -848,11 +875,17 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_preparing, false);
         atomic_init(&_generation, 1);
         atomic_init(&_presented, 0); atomic_init(&_captured, 0); atomic_init(&_encoded, 0);
-        atomic_init(&_droppedPool, 0); atomic_init(&_droppedEncoder, 0); atomic_init(&_droppedLate, 0); atomic_init(&_droppedUnsupported, 0); atomic_init(&_skippedRate, 0);
+        atomic_init(&_droppedPool, 0); atomic_init(&_droppedEncoder, 0); atomic_init(&_droppedLate, 0);
+        atomic_init(&_droppedUnsupported, 0); atomic_init(&_skippedRate, 0);
+        atomic_init(&_lastLogSkipped, 0); atomic_init(&_samplingSkipMilliFPS, 0);
         atomic_init(&_lastLogTick, mach_continuous_time()); atomic_init(&_lastLogPresented, 0); atomic_init(&_lastLogEncoded, 0);
         atomic_init(&_drawableWidth, 0); atomic_init(&_drawableHeight, 0); atomic_init(&_pixelFormat, -1);
         atomic_init(&_framebufferOnly, -1); atomic_init(&_displaySync, -1); atomic_init(&_edr, -1);
         atomic_init(&_presentHookCount, 0);
+        atomic_init(&_skippedPresents, 0);
+        atomic_init(&_ownedCaptureCommandBuffers, 0);
+        atomic_init(&_lastOwnedCaptureGPUTimeUs, 0);
+        atomic_init(&_lastOwnedCaptureCompletionUs, 0);
         atomic_init(&_layerNeedsRefresh, true);
         _originalColorSpace = NULL;
         [self reloadConfiguration];
@@ -865,11 +898,12 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     NSNumber *enabledValue = [config[@"enabled"] isKindOfClass:[NSNumber class]] ? config[@"enabled"] : nil;
     long long configFPS = [config[@"fps"] respondsToSelector:@selector(longLongValue)] ? [config[@"fps"] longLongValue] : 120;
     long long configBitrate = [config[@"bitrate"] respondsToSelector:@selector(longLongValue)] ? [config[@"bitrate"] longLongValue] : 120000000;
-    long long configBuffers = [config[@"buffers"] respondsToSelector:@selector(longLongValue)] ? [config[@"buffers"] longLongValue] : 6;
+    long long configBuffers = [config[@"buffers"] respondsToSelector:@selector(longLongValue)] ? [config[@"buffers"] longLongValue] : 3;
     double configLogInterval = [config[@"logInterval"] respondsToSelector:@selector(doubleValue)] ? [config[@"logInterval"] doubleValue] : 1.0;
     BOOL configDisableDisplaySync = [config[@"disableDisplaySync"] respondsToSelector:@selector(boolValue)] ? [config[@"disableDisplaySync"] boolValue] : NO;
     BOOL configForceSDR = [config[@"forceSDRDisplay"] respondsToSelector:@selector(boolValue)] ? [config[@"forceSDRDisplay"] boolValue] : YES;
     BOOL configSuppressDisplay = [config[@"suppressDisplayOutput"] respondsToSelector:@selector(boolValue)] ? [config[@"suppressDisplayOutput"] boolValue] : NO;
+    BOOL configSkipDisplayPresent = [config[@"skipDisplayPresent"] respondsToSelector:@selector(boolValue)] ? [config[@"skipDisplayPresent"] boolValue] : NO;
     NSString *configResolution = [config[@"resolutionMode"] isKindOfClass:[NSString class]] ? [config[@"resolutionMode"] lowercaseString] : @"source";
     long long configCaptureWidth = [config[@"captureWidth"] respondsToSelector:@selector(longLongValue)] ? [config[@"captureWidth"] longLongValue] : 1920;
     long long configCaptureHeight = [config[@"captureHeight"] respondsToSelector:@selector(longLongValue)] ? [config[@"captureHeight"] longLongValue] : 1080;
@@ -884,6 +918,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     self.disableDisplaySync = ptmc_env_bool("PTMC_DISABLE_DISPLAY_SYNC", configDisableDisplaySync);
     self.forceSDRDisplay = ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", configForceSDR);
     self.suppressDisplayOutput = ptmc_env_bool("PTMC_SUPPRESS_DISPLAY", configSuppressDisplay);
+    self.skipDisplayPresent = ptmc_env_bool("PTMC_SKIP_DISPLAY_PRESENT", configSkipDisplayPresent);
     NSString *resolutionMode = [ptmc_env_string("PTMC_RESOLUTION_MODE", configResolution) lowercaseString];
     NSSet *allowedResolutions = [NSSet setWithArray:@[@"source", @"2160p", @"1440p", @"1080p", @"720p", @"custom"]];
     if (![allowedResolutions containsObject:resolutionMode]) resolutionMode = @"source";
@@ -922,6 +957,12 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     atomic_store_explicit(&_droppedLate, 0, memory_order_relaxed);
     atomic_store_explicit(&_droppedUnsupported, 0, memory_order_relaxed);
     atomic_store_explicit(&_skippedRate, 0, memory_order_relaxed);
+    atomic_store_explicit(&_lastLogSkipped, 0, memory_order_relaxed);
+    atomic_store_explicit(&_samplingSkipMilliFPS, 0, memory_order_relaxed);
+    atomic_store_explicit(&_skippedPresents, 0, memory_order_relaxed);
+    atomic_store_explicit(&_ownedCaptureCommandBuffers, 0, memory_order_relaxed);
+    atomic_store_explicit(&_lastOwnedCaptureGPUTimeUs, 0, memory_order_relaxed);
+    atomic_store_explicit(&_lastOwnedCaptureCompletionUs, 0, memory_order_relaxed);
     self.captureLayer = nil;
     atomic_store_explicit(&_layerNeedsRefresh, true, memory_order_release);
     atomic_store_explicit(&ptmc_recording_fast, true, memory_order_release);
@@ -949,7 +990,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_store_explicit(&session->_accepting, false, memory_order_release);
         dispatch_async(session.encoderQueue, ^{
             if (session.compressionSession) VTCompressionSessionCompleteFrames(session.compressionSession, kCMTimeInvalid);
-            ptmc_finalize_session_when_drained(session);
+            dispatch_async(session.writerQueue, ^{ ptmc_finalize_session_when_drained(session); });
         });
     }
     PTMC_LOG(@"stop requested");
@@ -977,8 +1018,16 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         s.captureIntervalTicks = ptmc_ns_to_ticks(1000000000ull / (uint64_t)MAX(s.fps, 1));
         s.bitrate = self.bitrate; s.codecName = self.codecName; s.bufferCount = self.bufferCount;
         s.device = device;
-        s.encoderQueue = dispatch_queue_create("io.playcover.ptmc.encoder", DISPATCH_QUEUE_SERIAL);
-        atomic_init(&s->_accepting, true); atomic_init(&s->_inFlight, 0); atomic_init(&s->_firstTick, 0); atomic_init(&s->_firstHostTime, 0); atomic_init(&s->_lastCaptureTick, 0); atomic_init(&s->_lastPTSUnits, -1);
+        dispatch_queue_attr_t encoderAttr = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
+        dispatch_queue_attr_t writerAttr = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+        s.encoderQueue = dispatch_queue_create("io.playcover.ptmc.encoder", encoderAttr);
+        s.writerQueue = dispatch_queue_create("io.playcover.ptmc.writer", writerAttr);
+        atomic_init(&s->_accepting, true); atomic_init(&s->_inFlight, 0);
+        atomic_init(&s->_firstTick, 0); atomic_init(&s->_firstHostTime, 0);
+        atomic_init(&s->_nextCaptureTick, 0); atomic_init(&s->_pendingWrites, 0);
+        atomic_init(&s->_lastPTSUnits, -1);
         s.outputPath = ptmc_output_path_from_environment();
         BOOL ok = ptmc_create_pipelines(s) && ptmc_create_slots(s) && ptmc_create_video_session(s);
         if (ok && atomic_load_explicit(&self->_requested, memory_order_acquire)) {
@@ -1024,12 +1073,28 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     }
     // The configured FPS is a real capture-rate ceiling, not just encoder metadata. A 120 Hz
     // game captured at 60 fps now performs roughly half as many BGRA->NV12 conversions/encodes.
-    uint64_t lastCapture = atomic_load_explicit(&session->_lastCaptureTick, memory_order_relaxed);
-    if (lastCapture != 0 && tick - lastCapture < session.captureIntervalTicks) {
+    // Deadline-based sampling with a small jitter tolerance. Comparing only against the previous
+    // captured frame can accidentally turn a nominal 60 Hz stream into ~30 fps when presents land
+    // a fraction of a millisecond before the exact 16.667 ms boundary. Keep a stable deadline instead.
+    uint64_t interval = session.captureIntervalTicks;
+    uint64_t tolerance = MIN(interval / 8, ptmc_ns_to_ticks(1000000ull)); // <= 1 ms
+    uint64_t nextTick = atomic_load_explicit(&session->_nextCaptureTick, memory_order_relaxed);
+    if (nextTick == 0) {
+        atomic_store_explicit(&session->_nextCaptureTick, tick + interval, memory_order_relaxed);
+    } else if (tick + tolerance < nextTick) {
+        // Intentional sampling skip (e.g. source 120 Hz -> capture 60 fps), not an encoder drop.
         atomic_fetch_add_explicit(&_skippedRate, 1, memory_order_relaxed);
         return;
+    } else {
+        uint64_t advanced = nextTick;
+        if (tick > nextTick + interval * 4) {
+            // Recover immediately after a long stall/suspend instead of trying to catch up.
+            advanced = tick + interval;
+        } else {
+            do { advanced += interval; } while (advanced <= tick);
+        }
+        atomic_store_explicit(&session->_nextCaptureTick, advanced, memory_order_relaxed);
     }
-    atomic_store_explicit(&session->_lastCaptureTick, tick, memory_order_relaxed);
     if (atomic_load_explicit(&session->_firstHostTime, memory_order_relaxed) == 0) {
         uint64_t zeroHost = 0;
         uint64_t hostNow = mach_absolute_time();
@@ -1134,8 +1199,27 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     uint64_t generation = session.generation;
     atomic_fetch_add_explicit(&session->_inFlight, 1, memory_order_acq_rel);
     atomic_fetch_add_explicit(&_captured, 1, memory_order_relaxed);
+    uint64_t ownedSubmitTick = ownsCmdBuffer ? mach_continuous_time() : 0;
+    if (ownsCmdBuffer) atomic_fetch_add_explicit(&_ownedCaptureCommandBuffers, 1, memory_order_relaxed);
 
     [activeCmdBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        if (ownsCmdBuffer) {
+            uint64_t completedTick = mach_continuous_time();
+            atomic_store_explicit(&self->_lastOwnedCaptureCompletionUs,
+                                  ptmc_ticks_to_ns(completedTick - ownedSubmitTick) / 1000u,
+                                  memory_order_relaxed);
+            SEL startSelector = NSSelectorFromString(@"GPUStartTime");
+            SEL endSelector = NSSelectorFromString(@"GPUEndTime");
+            if ([cb respondsToSelector:startSelector] && [cb respondsToSelector:endSelector]) {
+                CFTimeInterval startTime = ((CFTimeInterval (*)(id, SEL))objc_msgSend)(cb, startSelector);
+                CFTimeInterval endTime = ((CFTimeInterval (*)(id, SEL))objc_msgSend)(cb, endSelector);
+                if (endTime >= startTime && startTime > 0) {
+                    atomic_store_explicit(&self->_lastOwnedCaptureGPUTimeUs,
+                                          (uint64_t)((endTime - startTime) * 1000000.0),
+                                          memory_order_relaxed);
+                }
+            }
+        }
         if (cb.status != MTLCommandBufferStatusCompleted || cb.error) {
             ptmc_release_slot(slot);
             atomic_fetch_sub_explicit(&session->_inFlight, 1, memory_order_acq_rel);
@@ -1185,17 +1269,22 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     double seconds = MAX((double)elapsedNs / 1e9, 0.001);
     uint64_t p = atomic_load_explicit(&_presented, memory_order_relaxed);
     uint64_t e = atomic_load_explicit(&_encoded, memory_order_relaxed);
+    uint64_t samplingSkipped = atomic_load_explicit(&_skippedRate, memory_order_relaxed);
     uint64_t lp = atomic_exchange_explicit(&_lastLogPresented, p, memory_order_acq_rel);
     uint64_t le = atomic_exchange_explicit(&_lastLogEncoded, e, memory_order_acq_rel);
-    PTMC_LOG(@"present=%.2f fps drawable=%llux%llu pixelFormat=%lld displaySync=%lld framebufferOnly=%lld captured=%llu encoded=%.2f fps dropped_pool=%llu dropped_encoder=%llu dropped_late=%llu unsupported=%llu skipped_rate=%llu codec=%@ resolution=%@ suppressDisplay=%d requested=%d",
+    uint64_t ls = atomic_exchange_explicit(&_lastLogSkipped, samplingSkipped, memory_order_acq_rel);
+    double skipPerSecond = (samplingSkipped - ls) / seconds;
+    atomic_store_explicit(&_samplingSkipMilliFPS, (uint64_t)llround(skipPerSecond * 1000.0), memory_order_relaxed);
+    PTMC_LOG(@"present=%.2f fps drawable=%llux%llu pixelFormat=%lld displaySync=%lld framebufferOnly=%lld captured=%llu encoded=%.2f fps dropped_pool=%llu dropped_encoder=%llu dropped_late=%llu unsupported=%llu sampling_skips=%llu (%.2f/s) codec=%@ resolution=%@ suppressDisplay=%d skipPresent=%d requested=%d",
              (p - lp) / seconds,
              (unsigned long long)atomic_load(&_drawableWidth), (unsigned long long)atomic_load(&_drawableHeight),
              (long long)atomic_load(&_pixelFormat), (long long)atomic_load(&_displaySync), (long long)atomic_load(&_framebufferOnly),
              (unsigned long long)atomic_load(&_captured), (e - le) / seconds,
              (unsigned long long)atomic_load(&_droppedPool), (unsigned long long)atomic_load(&_droppedEncoder),
              (unsigned long long)atomic_load(&_droppedLate), (unsigned long long)atomic_load(&_droppedUnsupported),
-             (unsigned long long)atomic_load(&_skippedRate), self.codecName ?: @"hevc",
-             self.captureResolutionMode ?: @"source", self.suppressDisplayOutput, atomic_load(&_requested));
+             (unsigned long long)samplingSkipped, skipPerSecond, self.codecName ?: @"hevc",
+             self.captureResolutionMode ?: @"source", self.suppressDisplayOutput, self.skipDisplayPresent,
+             atomic_load(&_requested));
     BOOL requested = atomic_load_explicit(&_requested, memory_order_acquire);
     if (force || requested) {
         PTMCSession *session = self.session;
@@ -1384,7 +1473,11 @@ static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager
     atomic_store_explicit(&manager->_framebufferOnly, layer.framebufferOnly ? 1 : 0, memory_order_relaxed);
 
     if (manager->_hasOriginalDisplaySync && [layer respondsToSelector:syncSetter]) {
-        BOOL desiredSync = manager.disableDisplaySync ? NO : manager->_originalDisplaySync;
+        // In headless mode the drawable is never submitted to CoreAnimation, so avoid mutating
+        // presentation-only state entirely. This minimizes CA/WindowServer work while recording.
+        BOOL desiredSync = manager.skipDisplayPresent
+            ? manager->_originalDisplaySync
+            : (manager.disableDisplaySync ? NO : manager->_originalDisplaySync);
         BOOL currentSync = ((BOOL (*)(id, SEL))objc_msgSend)(layer, syncGetter);
         if (currentSync != desiredSync) {
             ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, syncSetter, desiredSync);
@@ -1392,7 +1485,7 @@ static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager
         atomic_store_explicit(&manager->_displaySync, desiredSync ? 1 : 0, memory_order_relaxed);
     }
 
-    if (manager.forceSDRDisplay) {
+    if (manager.forceSDRDisplay && !manager.skipDisplayPresent) {
         if (manager->_hasOriginalEDR && [layer respondsToSelector:edrSetter]) {
             BOOL currentEDR = ((BOOL (*)(id, SEL))objc_msgSend)(layer, edrGetter);
             if (currentEDR) ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, edrSetter, NO);
@@ -1414,7 +1507,8 @@ static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager
         BOOL differs = (current != original) && (!current || !original || !CFEqual(current, original));
         if (differs) layer.colorspace = original;
     }
-    float desiredOpacity = manager.suppressDisplayOutput ? 0.0f : manager->_originalOpacity;
+    // Full headless mode skips present itself; changing opacity would only create an extra CA transaction.
+    float desiredOpacity = (!manager.skipDisplayPresent && manager.suppressDisplayOutput) ? 0.0f : manager->_originalOpacity;
     if (fabsf(layer.opacity - desiredOpacity) > 0.0001f) {
         // Keep calling present so CAMetalDrawable objects recycle normally. Making the layer fully
         // transparent is the safe optional "capture-only" mode; WindowServer may cull the visible
@@ -1445,44 +1539,69 @@ static void ptmc_record_present(id commandBuffer, id<CAMetalDrawable> drawable) 
     }
 }
 
+static BOOL ptmc_should_skip_display_present(id<CAMetalDrawable> drawable) {
+    PTMCManager *manager = ptmc_manager();
+    if (!manager.skipDisplayPresent || !atomic_load_explicit(&manager->_requested, memory_order_acquire)) return NO;
+    PTMCSession *session = manager.session;
+    if (!session || !atomic_load_explicit(&session->_accepting, memory_order_acquire)) return NO;
+    id<MTLTexture> texture = drawable.texture;
+    if (!texture) return NO;
+    BOOL supported = texture.pixelFormat == MTLPixelFormatBGRA8Unorm ||
+                     texture.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB;
+    if (!supported) return NO;
+    atomic_fetch_add_explicit(&manager->_skippedPresents, 1, memory_order_relaxed);
+    return YES;
+}
+
 static void ptmc_present_drawable(id self, SEL _cmd, id<CAMetalDrawable> drawable) {
     if (!atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)) ptmc_record_present(self, drawable);
+    if (ptmc_should_skip_display_present(drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id<CAMetalDrawable>))original)(self, _cmd, drawable);
 }
 
 static void ptmc_present_drawable_at_time(id self, SEL _cmd, id<CAMetalDrawable> drawable, CFTimeInterval time) {
     if (!atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)) ptmc_record_present(self, drawable);
+    if (ptmc_should_skip_display_present(drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id<CAMetalDrawable>, CFTimeInterval))original)(self, _cmd, drawable, time);
 }
 
 static void ptmc_present_drawable_after_duration(id self, SEL _cmd, id<CAMetalDrawable> drawable, CFTimeInterval duration) {
     if (!atomic_load_explicit(&ptmc_drawable_path_active, memory_order_acquire)) ptmc_record_present(self, drawable);
+    if (ptmc_should_skip_display_present(drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id<CAMetalDrawable>, CFTimeInterval))original)(self, _cmd, drawable, duration);
 }
 
 static void ptmc_drawable_present(id self, SEL _cmd) {
-    ptmc_record_present(nil, (id<CAMetalDrawable>)self);
+    id<CAMetalDrawable> drawable = (id<CAMetalDrawable>)self;
+    ptmc_record_present(nil, drawable);
+    if (ptmc_should_skip_display_present(drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL))original)(self, _cmd);
 }
 
 static void ptmc_drawable_present_at_time(id self, SEL _cmd, CFTimeInterval time) {
-    ptmc_record_present(nil, (id<CAMetalDrawable>)self);
+    id<CAMetalDrawable> drawable = (id<CAMetalDrawable>)self;
+    ptmc_record_present(nil, drawable);
+    if (ptmc_should_skip_display_present(drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, CFTimeInterval))original)(self, _cmd, time);
 }
 
 static void ptmc_drawable_present_after_duration(id self, SEL _cmd, CFTimeInterval duration) {
-    ptmc_record_present(nil, (id<CAMetalDrawable>)self);
+    id<CAMetalDrawable> drawable = (id<CAMetalDrawable>)self;
+    ptmc_record_present(nil, drawable);
+    if (ptmc_should_skip_display_present(drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, CFTimeInterval))original)(self, _cmd, duration);
 }
 
 static void ptmc_drawable_present_with_options(id self, SEL _cmd, id options) {
-    ptmc_record_present(nil, (id<CAMetalDrawable>)self);
+    id<CAMetalDrawable> drawable = (id<CAMetalDrawable>)self;
+    ptmc_record_present(nil, drawable);
+    if (ptmc_should_skip_display_present(drawable)) return;
     IMP original = ptmc_original_imp(self, _cmd);
     if (original) ((void (*)(id, SEL, id))original)(self, _cmd, options);
 }
