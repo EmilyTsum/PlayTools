@@ -266,6 +266,9 @@ static NSString *ptmc_output_path_from_environment(void) {
 @end
 
 static PTMCManager *ptmc_manager(void);
+static void ptmc_discover_runtime_classes(void);
+static void ptmc_schedule_discovery(void);
+static void ptmc_update_max_fps_hook(void);
 static NSInteger ptmc_spoof_max_fps = 0;
 
 static dispatch_queue_t ptmc_status_queue(void) {
@@ -309,7 +312,9 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
             status[@"fps"] = @(session.fps);
             status[@"bitrate"] = @(session.bitrate);
             status[@"codec"] = session.codecName ?: manager.codecName ?: @"hevc";
-            status[@"firstVideoHostTime"] = @(atomic_load_explicit(&session->_firstHostTime, memory_order_acquire));
+            uint64_t firstHostTime = atomic_load_explicit(&session->_firstHostTime, memory_order_acquire);
+            status[@"firstVideoHostTime"] = @(firstHostTime);
+            status[@"firstVideoHostTimeNs"] = @(firstHostTime ? ptmc_ticks_to_ns(firstHostTime) : 0);
             if (session.outputPath.length > 0) status[@"outputPath"] = session.outputPath;
         }
         NSURL *url = [NSURL fileURLWithPath:path];
@@ -725,12 +730,19 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 - (void)start {
     [self reloadConfiguration];
     atomic_store_explicit(&_requested, true, memory_order_release);
+    ptmc_update_max_fps_hook();
+    // Install expensive frame-path hooks only when recording is actually requested. Games that
+    // never record now run with their original Metal dispatch untouched.
+    ptmc_discover_runtime_classes();
+    ptmc_schedule_discovery();
     PTMC_LOG(@"start requested; capture will arm on the next supported drawable");
     ptmc_publish_status(self, self.session, @"requested", @"Waiting for the next supported Metal drawable");
 }
 
 - (void)stop {
     atomic_store_explicit(&_requested, false, memory_order_release);
+    ptmc_spoof_max_fps = 0;
+    ptmc_update_max_fps_hook();
     PTMCSession *session = self.session;
     self.session = nil;
     atomic_store_explicit(&_preparing, false, memory_order_release);
@@ -976,16 +988,32 @@ static atomic_bool ptmc_discovery_scheduled;
 static atomic_bool ptmc_image_scan_pending;
 static IMP ptmc_max_fps_original = NULL;
 
+typedef struct {
+    __unsafe_unretained Class cls;
+    SEL selector;
+    IMP original;
+} PTMCImpCacheEntry;
+
+static _Thread_local PTMCImpCacheEntry ptmc_imp_cache[8];
+
 static IMP ptmc_original_imp(id self, SEL selector) {
+    Class runtimeClass = object_getClass(self);
+    uintptr_t hash = (((uintptr_t)runtimeClass >> 4) ^ ((uintptr_t)selector >> 4)) & 7u;
+    PTMCImpCacheEntry cached = ptmc_imp_cache[hash];
+    if (cached.cls == runtimeClass && cached.selector == selector && cached.original) return cached.original;
+
     unsigned count = atomic_load_explicit(&ptmc_hook_count, memory_order_acquire);
-    for (Class cls = object_getClass(self); cls != Nil; cls = class_getSuperclass(cls)) {
+    IMP original = NULL;
+    for (Class cls = runtimeClass; cls != Nil && !original; cls = class_getSuperclass(cls)) {
         for (unsigned i = 0; i < count; i++) {
             if (ptmc_hooks[i].cls == cls && ptmc_hooks[i].selector == selector) {
-                return ptmc_hooks[i].original;
+                original = ptmc_hooks[i].original;
+                break;
             }
         }
     }
-    return NULL;
+    ptmc_imp_cache[hash] = (PTMCImpCacheEntry){ .cls = runtimeClass, .selector = selector, .original = original };
+    return original;
 }
 
 static BOOL ptmc_class_implements_selector(Class cls, SEL selector, Method *methodOut) {
@@ -1063,15 +1091,10 @@ static void ptmc_drawable_present_with_options(id self, SEL _cmd, id options) {
 }
 
 static BOOL ptmc_install_one_hook(Class cls, SEL selector, IMP replacement) {
-    Method resolvedMethod = class_getInstanceMethod(cls, selector);
-    if (!resolvedMethod) return NO;
-
     Method ownMethod = NULL;
-    BOOL declaresMethod = ptmc_class_implements_selector(cls, selector, &ownMethod) && ownMethod;
-    IMP original = method_getImplementation(resolvedMethod);
+    if (!ptmc_class_implements_selector(cls, selector, &ownMethod) || !ownMethod) return NO;
+    IMP original = method_getImplementation(ownMethod);
     if (!original || original == replacement) return NO;
-    const char *types = method_getTypeEncoding(resolvedMethod);
-    if (!types) return NO;
 
     os_unfair_lock_lock(&ptmc_hook_lock);
     unsigned count = atomic_load_explicit(&ptmc_hook_count, memory_order_relaxed);
@@ -1086,30 +1109,25 @@ static BOOL ptmc_install_one_hook(Class cls, SEL selector, IMP replacement) {
         PTMC_LOG(@"hook table full");
         return NO;
     }
-
-    // Publish the original IMP before changing dispatch so the replacement can always tail-call it.
     ptmc_hooks[count] = (PTMCHookEntry){ .cls = cls, .selector = selector, .original = original };
     atomic_store_explicit(&ptmc_hook_count, count + 1, memory_order_release);
-
-    BOOL installed = YES;
-    if (declaresMethod) {
-        method_setImplementation(ownMethod, replacement);
-    } else {
-        // Real Apple Silicon AGX command-buffer classes conform to MTLCommandBuffer but inherit
-        // presentDrawable:* from _MTLCommandBuffer, which itself does not report protocol
-        // conformance. Add a concrete override so those real submissions are intercepted.
-        installed = class_addMethod(cls, selector, replacement, types);
-    }
-
-    if (!installed) {
-        atomic_store_explicit(&ptmc_hook_count, count, memory_order_release);
-        os_unfair_lock_unlock(&ptmc_hook_lock);
-        return NO;
-    }
-
+    method_setImplementation(ownMethod, replacement);
     os_unfair_lock_unlock(&ptmc_hook_lock);
     return YES;
 }
+
+static Class ptmc_method_owner(Class cls, SEL selector) {
+    for (Class current = cls; current != Nil; current = class_getSuperclass(current)) {
+        if (ptmc_class_implements_selector(current, selector, NULL)) return current;
+    }
+    return Nil;
+}
+
+static BOOL ptmc_install_owner_hook(Class cls, SEL selector, IMP replacement) {
+    Class owner = ptmc_method_owner(cls, selector);
+    return owner ? ptmc_install_one_hook(owner, selector, replacement) : NO;
+}
+
 static BOOL ptmc_class_is_subclass_of(Class cls, Class base) {
     for (Class current = cls; current != Nil; current = class_getSuperclass(current)) {
         if (current == base) return YES;
@@ -1146,9 +1164,9 @@ static void ptmc_discover_runtime_classes(void) {
 
     if (baseCmdBufferClass) {
         unsigned presentInstalled = 0;
-        presentInstalled += ptmc_install_one_hook(baseCmdBufferClass, s1, (IMP)ptmc_present_drawable);
-        presentInstalled += ptmc_install_one_hook(baseCmdBufferClass, s2, (IMP)ptmc_present_drawable_at_time);
-        presentInstalled += ptmc_install_one_hook(baseCmdBufferClass, s3, (IMP)ptmc_present_drawable_after_duration);
+        presentInstalled += ptmc_install_owner_hook(baseCmdBufferClass, s1, (IMP)ptmc_present_drawable);
+        presentInstalled += ptmc_install_owner_hook(baseCmdBufferClass, s2, (IMP)ptmc_present_drawable_at_time);
+        presentInstalled += ptmc_install_owner_hook(baseCmdBufferClass, s3, (IMP)ptmc_present_drawable_after_duration);
         if (presentInstalled) {
             atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, presentInstalled, memory_order_relaxed);
             PTMC_LOG(@"base command-buffer hooks class=%@ installed=%u", NSStringFromClass(baseCmdBufferClass), presentInstalled);
@@ -1158,10 +1176,10 @@ static void ptmc_discover_runtime_classes(void) {
 
     if (metalDrawableClass) {
         unsigned drawableInstalled = 0;
-        drawableInstalled += ptmc_install_one_hook(metalDrawableClass, d1, (IMP)ptmc_drawable_present);
-        drawableInstalled += ptmc_install_one_hook(metalDrawableClass, d2, (IMP)ptmc_drawable_present_at_time);
-        drawableInstalled += ptmc_install_one_hook(metalDrawableClass, d3, (IMP)ptmc_drawable_present_after_duration);
-        drawableInstalled += ptmc_install_one_hook(metalDrawableClass, d4, (IMP)ptmc_drawable_present_with_options);
+        drawableInstalled += ptmc_install_owner_hook(metalDrawableClass, d1, (IMP)ptmc_drawable_present);
+        drawableInstalled += ptmc_install_owner_hook(metalDrawableClass, d2, (IMP)ptmc_drawable_present_at_time);
+        drawableInstalled += ptmc_install_owner_hook(metalDrawableClass, d3, (IMP)ptmc_drawable_present_after_duration);
+        drawableInstalled += ptmc_install_owner_hook(metalDrawableClass, d4, (IMP)ptmc_drawable_present_with_options);
         if (drawableInstalled) {
             atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, drawableInstalled, memory_order_relaxed);
             PTMC_LOG(@"base drawable hooks class=%@ installed=%u", NSStringFromClass(metalDrawableClass), drawableInstalled);
@@ -1173,9 +1191,9 @@ static void ptmc_discover_runtime_classes(void) {
         Class cls = classes[i];
         if (class_conformsToProtocol(cls, protocol) || (baseCmdBufferClass && ptmc_class_is_subclass_of(cls, baseCmdBufferClass))) {
             unsigned presentInstalled = 0;
-            presentInstalled += ptmc_install_one_hook(cls, s1, (IMP)ptmc_present_drawable);
-            presentInstalled += ptmc_install_one_hook(cls, s2, (IMP)ptmc_present_drawable_at_time);
-            presentInstalled += ptmc_install_one_hook(cls, s3, (IMP)ptmc_present_drawable_after_duration);
+            presentInstalled += ptmc_install_owner_hook(cls, s1, (IMP)ptmc_present_drawable);
+            presentInstalled += ptmc_install_owner_hook(cls, s2, (IMP)ptmc_present_drawable_at_time);
+            presentInstalled += ptmc_install_owner_hook(cls, s3, (IMP)ptmc_present_drawable_after_duration);
             if (presentInstalled) {
                 atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, presentInstalled, memory_order_relaxed);
                 PTMC_LOG(@"command-buffer hooks class=%@ installed=%u", NSStringFromClass(cls), presentInstalled);
@@ -1184,19 +1202,19 @@ static void ptmc_discover_runtime_classes(void) {
         }
         if (class_conformsToProtocol(cls, drawableProtocol) || (metalDrawableClass && ptmc_class_is_subclass_of(cls, metalDrawableClass))) {
             unsigned drawableInstalled = 0;
-            drawableInstalled += ptmc_install_one_hook(cls, d1, (IMP)ptmc_drawable_present);
-            drawableInstalled += ptmc_install_one_hook(cls, d2, (IMP)ptmc_drawable_present_at_time);
-            drawableInstalled += ptmc_install_one_hook(cls, d3, (IMP)ptmc_drawable_present_after_duration);
-            drawableInstalled += ptmc_install_one_hook(cls, d4, (IMP)ptmc_drawable_present_with_options);
+            drawableInstalled += ptmc_install_owner_hook(cls, d1, (IMP)ptmc_drawable_present);
+            drawableInstalled += ptmc_install_owner_hook(cls, d2, (IMP)ptmc_drawable_present_at_time);
+            drawableInstalled += ptmc_install_owner_hook(cls, d3, (IMP)ptmc_drawable_present_after_duration);
+            drawableInstalled += ptmc_install_owner_hook(cls, d4, (IMP)ptmc_drawable_present_with_options);
             if (drawableInstalled) {
                 atomic_fetch_add_explicit(&ptmc_manager()->_presentHookCount, drawableInstalled, memory_order_relaxed);
                 installed += drawableInstalled;
             }
         }
         if (ptmc_class_is_subclass_of(cls, metalLayerClass)) {
-            installed += ptmc_install_one_hook(cls, next, (IMP)ptmc_next_drawable);
-            installed += ptmc_install_one_hook(cls, setEDR, (IMP)ptmc_set_wants_edr);
-            installed += ptmc_install_one_hook(cls, setColorSpace, (IMP)ptmc_set_colorspace);
+            installed += ptmc_install_owner_hook(cls, next, (IMP)ptmc_next_drawable);
+            installed += ptmc_install_owner_hook(cls, setEDR, (IMP)ptmc_set_wants_edr);
+            installed += ptmc_install_owner_hook(cls, setColorSpace, (IMP)ptmc_set_colorspace);
         }
     }
     free(classes);
@@ -1205,6 +1223,8 @@ static void ptmc_discover_runtime_classes(void) {
 
 static void ptmc_image_added(const struct mach_header *header, intptr_t slide) {
     (void)header; (void)slide;
+    PTMCManager *manager = ptmc_manager();
+    if (!atomic_load_explicit(&manager->_requested, memory_order_acquire)) return;
     bool expected = false;
     if (!atomic_compare_exchange_strong(&ptmc_image_scan_pending, &expected, true)) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
@@ -1217,7 +1237,7 @@ static void ptmc_image_added(const struct mach_header *header, intptr_t slide) {
 static void ptmc_schedule_discovery(void) {
     bool expected = false;
     if (!atomic_compare_exchange_strong(&ptmc_discovery_scheduled, &expected, true)) return;
-    static const double delays[] = {0.0, 0.05, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0};
+    static const double delays[] = {0.0, 0.1, 0.5, 2.0};
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
     for (unsigned i = 0; i < sizeof(delays)/sizeof(delays[0]); i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)), q, ^{
@@ -1227,7 +1247,7 @@ static void ptmc_schedule_discovery(void) {
 }
 
 static BOOL ptmc_should_force_sdr(PTMCManager *manager) {
-    return manager.captureEnabled && manager.forceSDRDisplay;
+    return atomic_load_explicit(&manager->_requested, memory_order_acquire) && manager.forceSDRDisplay;
 }
 
 static void ptmc_observe_and_normalize_layer(CAMetalLayer *layer, PTMCManager *manager) {
@@ -1259,10 +1279,9 @@ static void ptmc_observe_and_normalize_layer(CAMetalLayer *layer, PTMCManager *m
 
 static id<CAMetalDrawable> ptmc_next_drawable(CAMetalLayer *self, SEL _cmd) {
     PTMCManager *manager = ptmc_manager();
-    ptmc_observe_and_normalize_layer(self, manager);
-
     BOOL requested = atomic_load_explicit(&manager->_requested, memory_order_acquire);
     if (requested) {
+        ptmc_observe_and_normalize_layer(self, manager);
         if (self.framebufferOnly) self.framebufferOnly = NO;
         if (manager.disableDisplaySync) {
             SEL setter = NSSelectorFromString(@"setDisplaySyncEnabled:");
@@ -1300,6 +1319,20 @@ static NSInteger ptmc_maximum_frames_per_second(id self, SEL _cmd) {
     return ptmc_max_fps_original ? ((NSInteger (*)(id, SEL))ptmc_max_fps_original)(self, _cmd) : 60;
 }
 
+static void ptmc_update_max_fps_hook(void) {
+    Method maxFPS = class_getInstanceMethod([UIScreen class], @selector(maximumFramesPerSecond));
+    if (!maxFPS) return;
+    IMP current = method_getImplementation(maxFPS);
+    if (ptmc_spoof_max_fps > 0) {
+        if (current != (IMP)ptmc_maximum_frames_per_second) {
+            ptmc_max_fps_original = current;
+            method_setImplementation(maxFPS, (IMP)ptmc_maximum_frames_per_second);
+        }
+    } else if (current == (IMP)ptmc_maximum_frames_per_second && ptmc_max_fps_original) {
+        method_setImplementation(maxFPS, ptmc_max_fps_original);
+    }
+}
+
 static CFStringRef ptmc_target_start_notification = NULL;
 static CFStringRef ptmc_target_stop_notification = NULL;
 static CFStringRef ptmc_target_status_notification = NULL;
@@ -1317,7 +1350,6 @@ static void ptmc_control_notification(CFNotificationCenterRef center, void *obse
     else if (ptmc_notification_matches(name, CFSTR("io.playcover.ptmc.status"), ptmc_target_status_notification)) {
         [manager reloadConfiguration];
         [manager logStatusForce:YES tick:mach_continuous_time()];
-        ptmc_discover_runtime_classes();
     }
 }
 
@@ -1331,13 +1363,6 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
     atomic_init(&ptmc_discovery_scheduled, false);
     atomic_init(&ptmc_image_scan_pending, false);
     PTMCManager *manager = ptmc_manager();
-    Method maxFPS = class_getInstanceMethod([UIScreen class], @selector(maximumFramesPerSecond));
-    if (maxFPS) {
-        ptmc_max_fps_original = method_getImplementation(maxFPS);
-        if (ptmc_max_fps_original != (IMP)ptmc_maximum_frames_per_second) {
-            method_setImplementation(maxFPS, (IMP)ptmc_maximum_frames_per_second);
-        }
-    }
     CFNotificationCenterRef darwin = CFNotificationCenterGetDarwinNotifyCenter();
     CFNotificationCenterAddObserver(darwin, NULL, ptmc_control_notification, CFSTR("io.playcover.ptmc.start"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(darwin, NULL, ptmc_control_notification, CFSTR("io.playcover.ptmc.stop"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
@@ -1352,12 +1377,11 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
         CFNotificationCenterAddObserver(darwin, NULL, ptmc_control_notification, ptmc_target_status_notification, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     }
     _dyld_register_func_for_add_image(ptmc_image_added);
-    ptmc_schedule_discovery();
-    PTMC_LOG(@"hooks ready bundle=%@ codec=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d forceSDR=%d spoofMaxFPS=%ld enabled=%d",
+    PTMC_LOG(@"runtime ready bundle=%@ codec=%@ fps=%ld bitrate=%ld buffers=%ld disableDisplaySync=%d forceSDR=%d spoofMaxFPS=%ld enabled=%d",
              bundleIdentifier ?: @"(unknown)", manager.codecName ?: @"hevc",
              (long)manager.fps, (long)manager.bitrate, (long)manager.bufferCount,
              manager.disableDisplaySync, manager.forceSDRDisplay, (long)ptmc_spoof_max_fps, enabled);
-    ptmc_publish_status(manager, nil, @"ready", @"PTMC hooks loaded and waiting for capture commands");
+    ptmc_publish_status(manager, nil, @"ready", @"PTMC runtime loaded; frame hooks are dormant until Start");
     manager.heartbeatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
     dispatch_source_set_timer(manager.heartbeatTimer,
@@ -1365,7 +1389,6 @@ static void __attribute__((constructor)) ptmc_initialize(void) {
                               NSEC_PER_SEC,
                               100 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(manager.heartbeatTimer, ^{
-        [manager reloadConfiguration];
         BOOL requested = atomic_load_explicit(&manager->_requested, memory_order_acquire);
         PTMCSession *session = manager.session;
         NSString *phase = !requested ? @"ready" : (session ? (session.writer ? @"recording" : @"armed") : @"requested");
