@@ -31,7 +31,7 @@ class ChildButtonModel: ControlModel<Button> {
         if code != KeyCodeNames.defaultCode {
             buttonData.keyCode = code
             buttonData.keyName = KeyCodeNames.keyCodes[code] ?? name
-        } else if let resolvedCode = KeyCodeNames.keyCodeByName[name] {
+        } else if let resolvedCode = KeyCodeNames.keyCodes.first(where: { $0.value == name })?.key {
             buttonData.keyCode = resolvedCode
             buttonData.keyName = name
         } else {
