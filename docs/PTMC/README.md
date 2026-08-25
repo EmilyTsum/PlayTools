@@ -13,7 +13,7 @@ Real Apple Silicon testing established the following facts:
 - The decisive Unity path observed later was direct `CAMetalDrawable.present*`, so direct drawable hooks are the preferred path; command-buffer interception is a compatibility fallback.
 - Repeated per-frame CAMetalLayer state writes caused measurable pacing disturbance. Capture-layer state is now prepared once when needed and restored on Stop.
 - A 120 Hz source captured at 60 fps should intentionally report roughly 60 sampling skips/s. `samplingSkipped` is not an encoder-drop counter.
-- A deeper raw ring can worsen game pacing at 4K by allowing more capture work to stay in flight. The normal default is 3 slots, plus one cooldown-limited preallocated emergency slot for isolated latency spikes.
+- A deeper GPU work queue can worsen game pacing at 4K. GPU admission therefore remains capped at the configured default of 3, independently of three additional preallocated raw surfaces that absorb VideoToolbox residency latency after Metal work completes.
 
 ## Current capture path
 
@@ -29,21 +29,21 @@ Important invariants:
 - no VideoToolbox/disk wait on the game render/present thread;
 - original present IMPs are restored when recording stops.
 
-HEVC converts/scales BGRA to video-range BT.709 NV12 on the GPU. ProRes 422 LT / 422 / 422 HQ use IOSurface-backed BGRA; native-size ProRes is a Metal blit and scaled ProRes is a GPU compute copy. Supported source drawable formats remain BGRA8Unorm and BGRA8Unorm_sRGB.
+HEVC 4:2:0 converts/scales BGRA to video-range BT.709 NV12 on the GPU. HEVC 4:2:2 Long GOP and All-I use 8-bit bi-planar 4:2:2 (`422v`) input; Apple VideoToolbox exposes that hardware path as Main 4:2:2 10 / Rext, so the resulting bitstream is reported as 10-bit despite 8-bit source precision. ProRes 422 LT / 422 / 422 HQ use IOSurface-backed BGRA; native-size ProRes is a Metal blit and scaled ProRes is a GPU compute copy. Supported source drawable formats remain BGRA8Unorm and BGRA8Unorm_sRGB.
 
 ## Runtime hooks and presentation
 
 Frame hooks are installed only while recording. Direct `CAMetalDrawable` hooks cover `present`, `presentAtTime:`, `presentAfterMinimumDuration:`, and the observed `presentWithOptions:` selector. Command-buffer `presentDrawable:*` hooks are installed only as fallback when the direct path is unavailable.
 
-Optional display suppression makes the active CAMetalLayer transparent while still presenting. Optional full present bypass is deliberately unsafe/experimental. Framebuffer-only, EDR, colorspace, display-sync, opacity, and HUD state are restored on Stop.
+Optional display suppression makes the active CAMetalLayer transparent while still presenting. Full present bypass remains an explicit performance mode: real 4K60 MV testing found zero drops with bypass, while continuing safe presents exhausted raw surfaces under the same ProRes workload. Framebuffer-only, EDR, colorspace, display-sync, opacity, and HUD state are restored on Stop.
 
 Metal HUD recording defaults to excluded. PTMC uses the runtime `developerHUDProperties` selector only when present, temporarily disables the HUD for the active layer, resists later property changes while recording, and restores the original dictionary on Stop. This runtime/private-ish behavior needs real-device validation after macOS changes.
 
 ## Performance / encoder behavior
 
-VideoToolbox submission and AVAssetWriter work are isolated on separate serial queues. Raw IOSurface slots are released from the VideoToolbox output callback before writer work. The callback context is stored in each preallocated slot instead of allocating an Objective-C frame object every frame.
+VideoToolbox submission and AVAssetWriter work are isolated on separate serial queues. GPU admission permits are released as soon as Metal conversion finishes; raw IOSurface slots remain resident until the VideoToolbox output callback. Separating these lifetimes prevents encoder latency from being mistaken for excessive GPU work while preserving the render-pacing cap. The callback context is stored in each preallocated slot instead of allocating an Objective-C frame object every frame.
 
-The sampler tracks present cadence. Near the target capture rate it accepts each present to avoid 60 Hz jitter turning into artificial holes. For clearly faster sources it uses deadline sampling. Runtime status exposes present/capture/encode FPS, intentional sampling skips/s, actual drop categories, in-flight/pending counts, and emergency-slot use.
+The sampler tracks present cadence. Near the target capture rate it accepts each present to avoid 60 Hz jitter turning into artificial holes. For clearly faster sources it uses deadline sampling. Runtime status exposes present/capture/encode FPS, intentional sampling skips/s, actual drop categories, separate GPU/VideoToolbox in-flight counts, allocated raw-surface count, and use of the additional residency surfaces.
 
 The latest user run reports zero video-frame drops after the jitter/backpressure changes. That is encouraging hardware evidence, but CI still cannot validate sustained 4K60/120 gameplay workloads. The current real-device item to verify is audio continuity after the PlayCover host-side PCM/backlog changes.
 

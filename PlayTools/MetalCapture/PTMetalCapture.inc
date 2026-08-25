@@ -131,6 +131,36 @@ static NSDictionary *ptmc_read_runtime_config(void) {
     return (NSDictionary *)object;
 }
 
+// Launch environment values bootstrap older/script-driven installs. Once PlayCover has written a
+// typed runtime plist, that file is authoritative so settings can change without relaunching the game.
+static BOOL ptmc_runtime_bool(NSDictionary *config, NSString *key, const char *environment, BOOL fallback) {
+    id value = config[key];
+    return [value isKindOfClass:[NSNumber class]] ? [value boolValue] : ptmc_env_bool(environment, fallback);
+}
+
+static long long ptmc_runtime_ll(NSDictionary *config, NSString *key, const char *environment,
+                                 long long fallback, long long minValue, long long maxValue) {
+    id value = config[key];
+    long long parsed = [value respondsToSelector:@selector(longLongValue)]
+        ? [value longLongValue] : ptmc_env_ll(environment, fallback, minValue, maxValue);
+    return MIN(MAX(parsed, minValue), maxValue);
+}
+
+static double ptmc_runtime_double(NSDictionary *config, NSString *key, const char *environment,
+                                  double fallback, double minValue, double maxValue) {
+    id value = config[key];
+    double parsed = [value respondsToSelector:@selector(doubleValue)]
+        ? [value doubleValue] : ptmc_env_double(environment, fallback, minValue, maxValue);
+    return MIN(MAX(parsed, minValue), maxValue);
+}
+
+static NSString *ptmc_runtime_string(NSDictionary *config, NSString *key,
+                                     const char *environment, NSString *fallback) {
+    id value = config[key];
+    return [value isKindOfClass:[NSString class]] && [value length] > 0
+        ? value : ptmc_env_string(environment, fallback);
+}
+
 static NSString *ptmc_timestamped_output_path(NSString *directory) {
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
@@ -188,12 +218,12 @@ static NSString *ptmc_output_path_from_environment(void) {
 @public
     atomic_bool _accepting;
     atomic_uint_fast64_t _inFlight;
+    atomic_uint_fast64_t _gpuInFlight;
     atomic_uint_fast64_t _firstTick;
     atomic_uint_fast64_t _firstHostTime;
     atomic_uint_fast64_t _nextCaptureTick;
     atomic_uint_fast64_t _lastPresentTick;
     atomic_uint_fast64_t _presentIntervalEWMATicks;
-    atomic_uint_fast64_t _burstSlotLastUseTick;
     atomic_uint_fast64_t _pendingWrites;
     atomic_int_fast64_t _lastPTSUnits;
 }
@@ -389,7 +419,9 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
             status[@"height"] = @(session.height);
             status[@"fps"] = @(session.fps);
             status[@"bufferCount"] = @(session.bufferCount);
+            status[@"allocatedBufferCount"] = @(session.slots.count);
             status[@"inFlight"] = @(atomic_load_explicit(&session->_inFlight, memory_order_relaxed));
+            status[@"gpuInFlight"] = @(atomic_load_explicit(&session->_gpuInFlight, memory_order_relaxed));
             status[@"pendingWrites"] = @(atomic_load_explicit(&session->_pendingWrites, memory_order_relaxed));
             status[@"bitrate"] = @(session.bitrate);
             status[@"codec"] = session.codecName ?: manager.codecName ?: @"hevc";
@@ -495,6 +527,27 @@ static const char *ptmc_shader_source =
     "    uvPlane.write(float4(clamp(cb, 0.0, 1.0), clamp(cr, 0.0, 1.0), 0.0, 1.0), cid);\n"
     "}\n"
     "\n"
+    "kernel void ptmc_bgra_to_nv16(texture2d<float, access::read> src [[texture(0)]],\n"
+    "                              texture2d<float, access::write> yPlane [[texture(1)]],\n"
+    "                              texture2d<float, access::write> uvPlane [[texture(2)]],\n"
+    "                              constant uint &sourceIsSRGB [[buffer(0)]],\n"
+    "                              uint2 cid [[thread_position_in_grid]]) {\n"
+    "    const uint width = src.get_width();\n"
+    "    const uint height = src.get_height();\n"
+    "    uint2 p0 = uint2(cid.x * 2u, cid.y);\n"
+    "    if (p0.x >= width || p0.y >= height) return;\n"
+    "    uint2 p1 = uint2(min(p0.x + 1u, width - 1u), p0.y);\n"
+    "    bool srgb = sourceIsSRGB != 0;\n"
+    "    float3 r0 = load_rgb(src, p0, srgb);\n"
+    "    float3 r1 = load_rgb(src, p1, srgb);\n"
+    "    yPlane.write(float4(clamp(luma709(r0), 0.0, 1.0)), p0);\n"
+    "    if (p1.x != p0.x) yPlane.write(float4(clamp(luma709(r1), 0.0, 1.0)), p1);\n"
+    "    float3 avg = (r0 + r1) * 0.5;\n"
+    "    float cb = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(-0.114572, -0.385428, 0.5));\n"
+    "    float cr = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(0.5, -0.454153, -0.045847));\n"
+    "    uvPlane.write(float4(clamp(cb, 0.0, 1.0), clamp(cr, 0.0, 1.0), 0.0, 1.0), cid);\n"
+    "}\n"
+    "\n"
     "inline float3 sample_rgb(texture2d<float, access::sample> src, sampler smp, float2 uv, bool sourceIsSRGB) {\n"
     "    float3 rgb = src.sample(smp, uv).rgb;\n"
     "    return sourceIsSRGB ? linear_to_srgb(rgb) : rgb;\n"
@@ -529,6 +582,29 @@ static const char *ptmc_shader_source =
     "    uvPlane.write(float4(clamp(cb, 0.0, 1.0), clamp(cr, 0.0, 1.0), 0.0, 1.0), cid);\n"
     "}\n"
     "\n"
+    "kernel void ptmc_bgra_to_nv16_scaled(texture2d<float, access::sample> src [[texture(0)]],\n"
+    "                                     texture2d<float, access::write> yPlane [[texture(1)]],\n"
+    "                                     texture2d<float, access::write> uvPlane [[texture(2)]],\n"
+    "                                     constant uint &sourceIsSRGB [[buffer(0)]],\n"
+    "                                     uint2 cid [[thread_position_in_grid]]) {\n"
+    "    const uint width = yPlane.get_width();\n"
+    "    const uint height = yPlane.get_height();\n"
+    "    uint2 p0 = uint2(cid.x * 2u, cid.y);\n"
+    "    if (p0.x >= width || p0.y >= height) return;\n"
+    "    uint2 p1 = uint2(min(p0.x + 1u, width - 1u), p0.y);\n"
+    "    constexpr sampler smp(coord::normalized, address::clamp_to_edge, filter::linear);\n"
+    "    float2 dims = float2(width, height);\n"
+    "    bool srgb = sourceIsSRGB != 0;\n"
+    "    float3 r0 = sample_rgb(src, smp, (float2(p0) + 0.5) / dims, srgb);\n"
+    "    float3 r1 = sample_rgb(src, smp, (float2(p1) + 0.5) / dims, srgb);\n"
+    "    yPlane.write(float4(clamp(luma709(r0), 0.0, 1.0)), p0);\n"
+    "    if (p1.x != p0.x) yPlane.write(float4(clamp(luma709(r1), 0.0, 1.0)), p1);\n"
+    "    float3 avg = (r0 + r1) * 0.5;\n"
+    "    float cb = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(-0.114572, -0.385428, 0.5));\n"
+    "    float cr = (128.0/255.0) + (224.0/255.0) * dot(avg, float3(0.5, -0.454153, -0.045847));\n"
+    "    uvPlane.write(float4(clamp(cb, 0.0, 1.0), clamp(cr, 0.0, 1.0), 0.0, 1.0), cid);\n"
+    "}\n"
+    "\n"
     "kernel void ptmc_bgra_scale_copy(texture2d<float, access::sample> src [[texture(0)]],\n"
     "                                 texture2d<float, access::write> dst [[texture(1)]],\n"
     "                                 constant uint &sourceIsSRGB [[buffer(0)]],\n"
@@ -548,34 +624,33 @@ static void ptmc_release_slot(PTMCSlot *slot) {
 }
 
 static PTMCSlot *ptmc_acquire_slot(PTMCSession *session, uint64_t tick, BOOL *usedBurst) {
+    (void)tick;
     if (usedBurst) *usedBurst = NO;
     NSUInteger regularCount = MIN((NSUInteger)MAX(session.bufferCount, 0), session.slots.count);
-    for (NSUInteger index = 0; index < regularCount; index++) {
+    for (NSUInteger index = 0; index < session.slots.count; index++) {
         PTMCSlot *slot = session.slots[index];
         bool expected = false;
         if (atomic_compare_exchange_strong_explicit(&slot->inUse, &expected, true,
                                                      memory_order_acq_rel, memory_order_relaxed)) {
+            if (usedBurst && index >= regularCount) *usedBurst = YES;
             return slot;
         }
     }
-
-    // A single preallocated burst slot absorbs isolated VideoToolbox latency spikes. The cooldown
-    // keeps it from becoming a permanently deeper raw-frame queue under sustained overload.
-    if (session.slots.count > regularCount) {
-        uint64_t cooldown = ptmc_ns_to_ticks(250000000ull);
-        uint64_t last = atomic_load_explicit(&session->_burstSlotLastUseTick, memory_order_relaxed);
-        if (last == 0 || tick - last >= cooldown) {
-            PTMCSlot *burst = session.slots[regularCount];
-            bool expected = false;
-            if (atomic_compare_exchange_strong_explicit(&burst->inUse, &expected, true,
-                                                         memory_order_acq_rel, memory_order_relaxed)) {
-                atomic_store_explicit(&session->_burstSlotLastUseTick, tick, memory_order_relaxed);
-                if (usedBurst) *usedBurst = YES;
-                return burst;
-            }
-        }
-    }
     return nil;
+}
+
+static BOOL ptmc_acquire_gpu_permit(PTMCSession *session) {
+    uint64_t current = atomic_load_explicit(&session->_gpuInFlight, memory_order_relaxed);
+    uint64_t limit = (uint64_t)MAX(session.bufferCount, 1);
+    while (current < limit) {
+        if (atomic_compare_exchange_weak_explicit(&session->_gpuInFlight, &current, current + 1,
+                                                  memory_order_acq_rel, memory_order_relaxed)) return YES;
+    }
+    return NO;
+}
+
+static void ptmc_release_gpu_permit(PTMCSession *session) {
+    atomic_fetch_sub_explicit(&session->_gpuInFlight, 1, memory_order_acq_rel);
 }
 
 static void ptmc_finalize_session_when_drained(PTMCSession *session) {
@@ -723,7 +798,18 @@ static CMVideoCodecType ptmc_codec_type(NSString *codecName) {
 }
 
 static BOOL ptmc_codec_is_hevc(NSString *codecName) {
-    return codecName.length == 0 || [codecName.lowercaseString isEqualToString:@"hevc"];
+    NSString *name = codecName.lowercaseString;
+    return name.length == 0 || [name isEqualToString:@"hevc"] ||
+           [name isEqualToString:@"hevc422long"] || [name isEqualToString:@"hevc422alli"];
+}
+
+static BOOL ptmc_codec_is_hevc422(NSString *codecName) {
+    NSString *name = codecName.lowercaseString;
+    return [name isEqualToString:@"hevc422long"] || [name isEqualToString:@"hevc422alli"];
+}
+
+static BOOL ptmc_codec_is_all_intra(NSString *codecName) {
+    return [codecName.lowercaseString isEqualToString:@"hevc422alli"];
 }
 
 static BOOL ptmc_create_video_session(PTMCSession *session) {
@@ -734,9 +820,12 @@ static BOOL ptmc_create_video_session(PTMCSession *session) {
             (__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES
         };
     }
-    OSType sourcePixelFormat = ptmc_codec_is_hevc(session.codecName)
-        ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        : kCVPixelFormatType_32BGRA;
+    OSType sourcePixelFormat = kCVPixelFormatType_32BGRA;
+    if (ptmc_codec_is_hevc(session.codecName)) {
+        sourcePixelFormat = ptmc_codec_is_hevc422(session.codecName)
+            ? kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange
+            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    }
     NSDictionary *sourceAttrs = @{
         (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(sourcePixelFormat),
         (__bridge NSString *)kCVPixelBufferWidthKey: @(session.width),
@@ -766,11 +855,15 @@ static BOOL ptmc_create_video_session(PTMCSession *session) {
     CFNumberRef fps = CFNumberCreate(kCFAllocatorDefault, kCFNumberNSIntegerType, &expectedFPS);
     if (fps) { VTSessionSetProperty(vt, kVTCompressionPropertyKey_ExpectedFrameRate, fps); CFRelease(fps); }
     if (ptmc_codec_is_hevc(session.codecName)) {
-        VTSessionSetProperty(vt, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel);
+        VTSessionSetProperty(vt, kVTCompressionPropertyKey_ProfileLevel,
+                             ptmc_codec_is_hevc422(session.codecName)
+                                 ? CFSTR("HEVC_Main42210_AutoLevel")
+                                 : kVTProfileLevel_HEVC_Main_AutoLevel);
         NSInteger averageBitrate = session.bitrate;
         CFNumberRef br = CFNumberCreate(kCFAllocatorDefault, kCFNumberNSIntegerType, &averageBitrate);
         if (br) { VTSessionSetProperty(vt, kVTCompressionPropertyKey_AverageBitRate, br); CFRelease(br); }
-        NSInteger keyInterval = MAX(session.fps * 2, 1);
+        NSInteger keyInterval = ptmc_codec_is_all_intra(session.codecName)
+            ? 1 : MAX(session.fps * 2, 1);
         CFNumberRef key = CFNumberCreate(kCFAllocatorDefault, kCFNumberNSIntegerType, &keyInterval);
         if (key) { VTSessionSetProperty(vt, kVTCompressionPropertyKey_MaxKeyFrameInterval, key); CFRelease(key); }
     }
@@ -796,8 +889,10 @@ static BOOL ptmc_create_video_session(PTMCSession *session) {
 
 static BOOL ptmc_create_slots(PTMCSession *session) {
     BOOL hevc = ptmc_codec_is_hevc(session.codecName);
+    BOOL hevc422 = ptmc_codec_is_hevc422(session.codecName);
     OSType pixelFormat = hevc
-        ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        ? (hevc422 ? kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange
+                   : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         : kCVPixelFormatType_32BGRA;
     NSDictionary *attrs = @{
         (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(pixelFormat),
@@ -807,7 +902,9 @@ static BOOL ptmc_create_slots(PTMCSession *session) {
         (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
     CVPixelBufferPoolRef pool = NULL;
-    NSInteger allocatedSlotCount = session.bufferCount + 1; // cooldown-limited burst slot
+    // GPU admission remains capped at bufferCount. Extra IOSurfaces absorb VideoToolbox ownership
+    // latency after GPU conversion has completed, without allowing a deeper queue of GPU work.
+    NSInteger allocatedSlotCount = session.bufferCount + 3;
     NSDictionary *poolAttrs = @{ (__bridge NSString *)kCVPixelBufferPoolMinimumBufferCountKey: @(allocatedSlotCount) };
     CVReturn rv = CVPixelBufferPoolCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)poolAttrs,
                                           (__bridge CFDictionaryRef)attrs, &pool);
@@ -847,7 +944,8 @@ static BOOL ptmc_create_slots(PTMCSession *session) {
             if (rv != kCVReturnSuccess || !slot->yTextureRef) break;
             rv = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, NULL,
                                                            MTLPixelFormatRG8Unorm,
-                                                           session.width / 2, session.height / 2, 1,
+                                                           session.width / 2,
+                                                           hevc422 ? session.height : session.height / 2, 1,
                                                            &slot->uvTextureRef);
             if (rv != kCVReturnSuccess || !slot->uvTextureRef) break;
             slot.yTexture = CVMetalTextureGetTexture(slot->yTextureRef);
@@ -866,7 +964,7 @@ static BOOL ptmc_create_slots(PTMCSession *session) {
     }
     CFRelease(pool);
     if (slots.count != allocatedSlotCount) {
-        PTMC_LOG(@"failed to preallocate %@ ring (%lu/%ld regular + 1 burst)",
+        PTMC_LOG(@"failed to preallocate %@ ring (%lu/%ld GPU + 3 encoder-residency)",
                  hevc ? @"NV12" : @"BGRA", (unsigned long)slots.count, (long)session.bufferCount);
         return NO;
     }
@@ -888,7 +986,10 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     }
 
     if (hevc) {
-        NSString *functionName = scaling ? @"ptmc_bgra_to_nv12_scaled" : @"ptmc_bgra_to_nv12";
+        BOOL hevc422 = ptmc_codec_is_hevc422(session.codecName);
+        NSString *functionName = hevc422
+            ? (scaling ? @"ptmc_bgra_to_nv16_scaled" : @"ptmc_bgra_to_nv16")
+            : (scaling ? @"ptmc_bgra_to_nv12_scaled" : @"ptmc_bgra_to_nv12");
         id<MTLFunction> function = [library newFunctionWithName:functionName];
         if (!function) return NO;
         id<MTLComputePipelineState> pipeline =
@@ -948,41 +1049,28 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
 
 - (void)reloadConfiguration {
     NSDictionary *config = ptmc_read_runtime_config();
-    NSNumber *enabledValue = [config[@"enabled"] isKindOfClass:[NSNumber class]] ? config[@"enabled"] : nil;
-    long long configFPS = [config[@"fps"] respondsToSelector:@selector(longLongValue)] ? [config[@"fps"] longLongValue] : 120;
-    long long configBitrate = [config[@"bitrate"] respondsToSelector:@selector(longLongValue)] ? [config[@"bitrate"] longLongValue] : 120000000;
-    long long configBuffers = [config[@"buffers"] respondsToSelector:@selector(longLongValue)] ? [config[@"buffers"] longLongValue] : 3;
-    double configLogInterval = [config[@"logInterval"] respondsToSelector:@selector(doubleValue)] ? [config[@"logInterval"] doubleValue] : 1.0;
-    BOOL configDisableDisplaySync = [config[@"disableDisplaySync"] respondsToSelector:@selector(boolValue)] ? [config[@"disableDisplaySync"] boolValue] : NO;
-    BOOL configForceSDR = [config[@"forceSDRDisplay"] respondsToSelector:@selector(boolValue)] ? [config[@"forceSDRDisplay"] boolValue] : YES;
-    BOOL configSuppressDisplay = [config[@"suppressDisplayOutput"] respondsToSelector:@selector(boolValue)] ? [config[@"suppressDisplayOutput"] boolValue] : NO;
-    BOOL configSkipDisplayPresent = [config[@"skipDisplayPresent"] respondsToSelector:@selector(boolValue)] ? [config[@"skipDisplayPresent"] boolValue] : NO;
-    BOOL configIncludeMetalHUD = [config[@"includeMetalHUDInCapture"] respondsToSelector:@selector(boolValue)] ? [config[@"includeMetalHUDInCapture"] boolValue] : NO;
-    NSString *configResolution = [config[@"resolutionMode"] isKindOfClass:[NSString class]] ? [config[@"resolutionMode"] lowercaseString] : @"source";
-    long long configCaptureWidth = [config[@"captureWidth"] respondsToSelector:@selector(longLongValue)] ? [config[@"captureWidth"] longLongValue] : 1920;
-    long long configCaptureHeight = [config[@"captureHeight"] respondsToSelector:@selector(longLongValue)] ? [config[@"captureHeight"] longLongValue] : 1080;
-    long long configSpoofFPS = [config[@"spoofMaxFPS"] respondsToSelector:@selector(longLongValue)] ? [config[@"spoofMaxFPS"] longLongValue] : 0;
-    NSString *configCodec = [config[@"codec"] isKindOfClass:[NSString class]] ? [config[@"codec"] lowercaseString] : @"hevc";
-
-    self.captureEnabled = enabledValue ? enabledValue.boolValue : ptmc_env_bool("PTMC_ENABLE", false);
-    self.fps = (NSInteger)ptmc_env_ll("PTMC_FPS", configFPS, 1, 240);
-    self.bitrate = (NSInteger)ptmc_env_ll("PTMC_BITRATE", configBitrate, 1000000, 1000000000);
-    self.bufferCount = (NSInteger)ptmc_env_ll("PTMC_BUFFERS", configBuffers, 3, 16);
-    self.logInterval = ptmc_env_double("PTMC_LOG_INTERVAL", configLogInterval, 0.25, 60.0);
-    self.disableDisplaySync = ptmc_env_bool("PTMC_DISABLE_DISPLAY_SYNC", configDisableDisplaySync);
-    self.forceSDRDisplay = ptmc_env_bool("PTMC_FORCE_SDR_DISPLAY", configForceSDR);
-    self.suppressDisplayOutput = ptmc_env_bool("PTMC_SUPPRESS_DISPLAY", configSuppressDisplay);
-    self.skipDisplayPresent = ptmc_env_bool("PTMC_SKIP_DISPLAY_PRESENT", configSkipDisplayPresent);
-    self.includeMetalHUDInCapture = ptmc_env_bool("PTMC_CAPTURE_METAL_HUD", configIncludeMetalHUD);
-    NSString *resolutionMode = [ptmc_env_string("PTMC_RESOLUTION_MODE", configResolution) lowercaseString];
+    self.captureEnabled = ptmc_runtime_bool(config, @"enabled", "PTMC_ENABLE", NO);
+    self.fps = (NSInteger)ptmc_runtime_ll(config, @"fps", "PTMC_FPS", 120, 1, 240);
+    self.bitrate = (NSInteger)ptmc_runtime_ll(config, @"bitrate", "PTMC_BITRATE",
+                                              120000000, 1000000, 1000000000);
+    self.bufferCount = (NSInteger)ptmc_runtime_ll(config, @"buffers", "PTMC_BUFFERS", 3, 3, 16);
+    self.logInterval = ptmc_runtime_double(config, @"logInterval", "PTMC_LOG_INTERVAL", 1.0, 0.25, 60.0);
+    self.disableDisplaySync = ptmc_runtime_bool(config, @"disableDisplaySync", "PTMC_DISABLE_DISPLAY_SYNC", NO);
+    self.forceSDRDisplay = ptmc_runtime_bool(config, @"forceSDRDisplay", "PTMC_FORCE_SDR_DISPLAY", YES);
+    self.suppressDisplayOutput = ptmc_runtime_bool(config, @"suppressDisplayOutput", "PTMC_SUPPRESS_DISPLAY", NO);
+    self.skipDisplayPresent = ptmc_runtime_bool(config, @"skipDisplayPresent", "PTMC_SKIP_DISPLAY_PRESENT", NO);
+    self.includeMetalHUDInCapture = ptmc_runtime_bool(config, @"includeMetalHUDInCapture", "PTMC_CAPTURE_METAL_HUD", NO);
+    NSString *resolutionMode = [ptmc_runtime_string(config, @"resolutionMode", "PTMC_RESOLUTION_MODE", @"source") lowercaseString];
     NSSet *allowedResolutions = [NSSet setWithArray:@[@"source", @"2160p", @"1440p", @"1080p", @"720p", @"custom"]];
     if (![allowedResolutions containsObject:resolutionMode]) resolutionMode = @"source";
     self.captureResolutionMode = resolutionMode;
-    self.captureWidth = (NSInteger)ptmc_env_ll("PTMC_CAPTURE_WIDTH", configCaptureWidth, 2, 16384);
-    self.captureHeight = (NSInteger)ptmc_env_ll("PTMC_CAPTURE_HEIGHT", configCaptureHeight, 2, 16384);
-    ptmc_spoof_max_fps = (NSInteger)ptmc_env_ll("PTMC_SPOOF_MAX_FPS", configSpoofFPS, 0, 240);
-    NSString *codec = [ptmc_env_string("PTMC_CODEC", configCodec) lowercaseString];
+    self.captureWidth = (NSInteger)ptmc_runtime_ll(config, @"captureWidth", "PTMC_CAPTURE_WIDTH", 1920, 2, 16384);
+    self.captureHeight = (NSInteger)ptmc_runtime_ll(config, @"captureHeight", "PTMC_CAPTURE_HEIGHT", 1080, 2, 16384);
+    ptmc_spoof_max_fps = (NSInteger)ptmc_runtime_ll(config, @"spoofMaxFPS", "PTMC_SPOOF_MAX_FPS", 0, 0, 240);
+    NSString *codec = [ptmc_runtime_string(config, @"codec", "PTMC_CODEC", @"hevc") lowercaseString];
     if (![codec isEqualToString:@"hevc"] &&
+        ![codec isEqualToString:@"hevc422long"] &&
+        ![codec isEqualToString:@"hevc422alli"] &&
         ![codec isEqualToString:@"prores422lt"] &&
         ![codec isEqualToString:@"prores422"] &&
         ![codec isEqualToString:@"prores422hq"]) {
@@ -1096,9 +1184,10 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         s.encoderQueue = dispatch_queue_create("io.playcover.ptmc.encoder", encoderAttr);
         s.writerQueue = dispatch_queue_create("io.playcover.ptmc.writer", writerAttr);
         atomic_init(&s->_accepting, true); atomic_init(&s->_inFlight, 0);
+        atomic_init(&s->_gpuInFlight, 0);
         atomic_init(&s->_firstTick, 0); atomic_init(&s->_firstHostTime, 0);
         atomic_init(&s->_nextCaptureTick, 0); atomic_init(&s->_lastPresentTick, 0);
-        atomic_init(&s->_presentIntervalEWMATicks, 0); atomic_init(&s->_burstSlotLastUseTick, 0);
+        atomic_init(&s->_presentIntervalEWMATicks, 0);
         atomic_init(&s->_pendingWrites, 0);
         atomic_init(&s->_lastPTSUnits, -1);
         s.outputPath = ptmc_output_path_from_environment();
@@ -1190,9 +1279,14 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_compare_exchange_strong_explicit(&session->_firstHostTime, &zeroHost, hostNow,
                                                 memory_order_acq_rel, memory_order_relaxed);
     }
+    if (!ptmc_acquire_gpu_permit(session)) {
+        atomic_fetch_add_explicit(&_droppedPool, 1, memory_order_relaxed);
+        return;
+    }
     BOOL usedBurstSlot = NO;
     PTMCSlot *slot = ptmc_acquire_slot(session, tick, &usedBurstSlot);
     if (!slot) {
+        ptmc_release_gpu_permit(session);
         atomic_fetch_add_explicit(&_droppedPool, 1, memory_order_relaxed);
         return;
     }
@@ -1208,6 +1302,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     }
     if (!activeCmdBuffer) {
         ptmc_release_slot(slot);
+        ptmc_release_gpu_permit(session);
         atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
         return;
     }
@@ -1218,6 +1313,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         if (!encoder || !pipeline) {
             [encoder endEncoding];
             ptmc_release_slot(slot);
+            ptmc_release_gpu_permit(session);
             atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
             return;
         }
@@ -1230,7 +1326,10 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         NSUInteger w = pipeline.threadExecutionWidth;
         NSUInteger h = MAX(1, pipeline.maxTotalThreadsPerThreadgroup / w);
         MTLSize tg = MTLSizeMake(w, MIN(h, 16), 1);
-        MTLSize grid = MTLSizeMake((session.width + 1) / 2, (session.height + 1) / 2, 1);
+        MTLSize grid = MTLSizeMake((session.width + 1) / 2,
+                                   ptmc_codec_is_hevc422(session.codecName)
+                                       ? session.height : (session.height + 1) / 2,
+                                   1);
         [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
         [encoder endEncoding];
     } else if (scaling) {
@@ -1240,6 +1339,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         if (!encoder || !session.pipelineScale || !slot.bgraTexture) {
             [encoder endEncoding];
             ptmc_release_slot(slot);
+            ptmc_release_gpu_permit(session);
             atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
             return;
         }
@@ -1260,6 +1360,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         if (!blit || !slot.bgraTexture) {
             [blit endEncoding];
             ptmc_release_slot(slot);
+            ptmc_release_gpu_permit(session);
             atomic_fetch_add_explicit(&_droppedEncoder, 1, memory_order_relaxed);
             return;
         }
@@ -1294,6 +1395,9 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     if (ownsCmdBuffer) atomic_fetch_add_explicit(&_ownedCaptureCommandBuffers, 1, memory_order_relaxed);
 
     [activeCmdBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        // GPU admission ends here. The IOSurface may remain owned by VideoToolbox until its output
+        // callback, but that encoder residency no longer deepens the queue of capture GPU work.
+        ptmc_release_gpu_permit(session);
         if (ownsCmdBuffer) {
             uint64_t completedTick = mach_continuous_time();
             atomic_store_explicit(&self->_lastOwnedCaptureCompletionUs,
