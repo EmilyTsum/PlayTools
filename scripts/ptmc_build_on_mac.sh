@@ -75,7 +75,7 @@ BIN="$FRAME/PlayTools"
 codesign --force --deep --sign - "$FRAME"
 {
   echo "fork_commit=$(git -C "$ROOT" rev-parse HEAD)"
-  echo "upstream_commit=$(git -C "$ROOT" rev-parse upstream/master 2>/dev/null || true)"
+  echo "upstream_commit=$(git -C "$ROOT" rev-parse --verify "$(cat "$ROOT/PTMC_UPSTREAM_COMMIT")^{commit}")"
   echo "macos_sdk=$MACOS_SDK"
   echo "catalyst_min=$MIN_CATALYST"
   xcrun vtool -show-build "$BIN"

@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - run: tests/ptmc_static.sh
       - run: python3 tests/ptmc_scheduler_model.py
       - run: python3 tests/ptmc_backpressure.py
@@ -21,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       - name: Toolchain
         run: |

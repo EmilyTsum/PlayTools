@@ -158,6 +158,11 @@ stresses their count/byte caps using eight threads, checks overflow arithmetic, 
 the callback's final-input ownership ordering. CI compiles both GPU harnesses; executing GPU
 work requires a Mac with an accessible Metal device and, for the runtime harness, a GUI session.
 
+CI artifact checkouts explicitly select the PR head SHA rather than GitHub's temporary
+merge commit. `BUILD_INFO.txt` records the actual fork commit and the verified upstream
+commit from `PTMC_UPSTREAM_COMMIT`; PlayCover's artifact records both pinned revisions.
+The earlier merge artifact had an identical tree, but its revision label was not the PR head.
+
 ## Required next game/device work
 
 Primary acceptance target: **ミリシタ**, bundle `jp.co.bandainamcoent.BNEI0310`.
