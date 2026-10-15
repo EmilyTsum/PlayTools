@@ -136,6 +136,36 @@ counts matched. A later direct-route Stop/Start run also finalized both files wi
 counts, while sync-on limited its producer to ~60 fps; the target remains 120 fps in settings,
 so that run is explicitly not a 120 fps throughput pass. This is a synthetic lifecycle reproduction, not attribution of the ミリシタ symptom.
 
+## ミリシタ short real-process smoke
+
+The installed ミリシタ v9.0.300 was also launched with the experimental framework selected
+through a process-local `DYLD_FRAMEWORK_PATH`. `lsof` confirmed the mapped framework under
+an isolated `PTMC Experiments` directory in the PlayCover container. Neither the game bundle
+nor the common installed PlayTools framework was replaced. The game kept its existing
+app-bundled AKInterface plugin, so this is capture-runtime testing, not a complete fresh
+4.x host/plugin installation acceptance test. The locally built runtime source is byte-identical
+to the final branch's `PTMetalCapture.inc`; subsequent commits change CI metadata/docs only.
+
+MV: **スペードのQ ぴえぴえver.**, 3D高画質, source drawable **3840x2160 BGRA8Unorm**.
+A ~20-second **visible, display-sync-on**, HEVC 4:2:2 Long GOP, target-60 trial captured and
+wrote **1190/1190 frames**, with GPU/pool/residency/encoder/late drops all zero. The observed
+hook route was **CAMetalDrawable**. The steady heartbeat window was 60.01 presents/captures
+per second; the maximum observed present interval including startup was 33,234 us. VT callback
+maximum was 95,536 us; the eight-slot ring drained successfully. Native sRGB view frame count
+was zero because this game used unorm input: the sRGB optimization is not the explanation
+for this result. The resulting 19.867 s MOV is HEVC Rext, `yuv422p10le`, 3840x2160 and fully
+decodes without ffmpeg errors. This trial contains video only; app audio/A/V sync were not tested.
+
+Two subsequent ~20-second sync-off/transparent smokes finalized 898/898 and 1196/1196 frames
+with zero pool/encoder/late drops. They include different MV segments or menu transitions;
+**they are not matched MV performance comparisons**. In particular the sync-off producer
+was not continuously 60 fps. No claim of improved ミリシタ performance follows from comparing
+those frame totals. Each trial disabled unsafe skip-present and restored the original runtime
+configuration byte-for-byte after Stop. The executable, Info.plist and original config hashes
+were checked for preservation. Test recording and isolated framework files remain separate
+from production captures. Sustained 4K60, 4K120, matched replay A/B, audio and full-plugin
+installation validation are still required.
+
 ## Reproduce
 
 From PlayTools on macOS with full Xcode selected:

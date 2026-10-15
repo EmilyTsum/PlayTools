@@ -97,3 +97,8 @@ serialized lifecycle, native sRGB view optimization, diagnostics, native GPU/cod
 and the remaining game/device acceptance plan. Idle heartbeats preserve the finalized/error
 result. Native smoke tests are not evidence that the reported real-game visible-preview
 stall has been fixed; independent preview remains unimplemented.
+
+The same validation document now includes a short real ミリシタ MV smoke: visible 3840x2160
+HEVC 4:2:2/60 captured and wrote 1190 frames without pool/encoder drops. It is video-only,
+uses the existing installed AKInterface plugin, and does not replace the sustained/matched
+MV, 120 fps, audio, or complete installation acceptance gates.
