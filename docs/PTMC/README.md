@@ -13,7 +13,7 @@ Real Apple Silicon testing established the following facts:
 - The decisive Unity path observed later was direct `CAMetalDrawable.present*`, so direct drawable hooks are the preferred path; command-buffer interception is a compatibility fallback.
 - Repeated per-frame CAMetalLayer state writes caused measurable pacing disturbance. Capture-layer state is now prepared once when needed and restored on Stop.
 - A 120 Hz source captured at 60 fps should intentionally report roughly 60 sampling skips/s. `samplingSkipped` is not an encoder-drop counter.
-- A deeper GPU work queue can worsen game pacing at 4K. GPU admission therefore remains capped at the configured default of 3, independently of three additional preallocated raw surfaces that absorb VideoToolbox residency latency after Metal work completes.
+- A deeper GPU work queue can worsen game pacing at 4K. GPU admission therefore remains capped at the configured default of 3, independently of `max(3, ceil(fps * 0.075))` additional preallocated raw surfaces (75 ms encoder-residency budget) that absorb VideoToolbox residency latency after Metal work completes.
 
 ## Current capture path
 
@@ -89,3 +89,11 @@ The host's low-latency preview experiment turns display synchronization off for 
 recording while retaining drawable presentation. This may reduce blocking on some
 macOS/game combinations, but can increase GPU load. Do not claim drop-free preview
 without a matched real-device capture comparison.
+
+## October 15 follow-up implementation and evidence
+
+See [preview validation](PREVIEW_VALIDATION_20261015.md) for the bounded writer handoff,
+serialized lifecycle, native sRGB view optimization, diagnostics, native GPU/codec tests,
+and the remaining game/device acceptance plan. Idle heartbeats preserve the finalized/error
+result. Native smoke tests are not evidence that the reported real-game visible-preview
+stall has been fixed; independent preview remains unimplemented.

@@ -14,6 +14,7 @@ jobs:
       - uses: actions/checkout@v7
       - run: tests/ptmc_static.sh
       - run: python3 tests/ptmc_scheduler_model.py
+      - run: python3 tests/ptmc_backpressure.py
       - run: tests/ptmc_patch_roundtrip.sh
   mac-build:
     runs-on: macos-latest
@@ -30,6 +31,10 @@ jobs:
         run: |
           python3 tests/extract_ptmc_shader.py > /tmp/PTMCShader.metal
           xcrun -sdk iphoneos metal -c /tmp/PTMCShader.metal -o /tmp/PTMCShader.air
+      - name: Compile GPU regression harnesses
+        run: |
+          xcrun clang -fobjc-arc -O2 -Werror -framework Foundation -framework Metal tests/ptmc_native_view.m -o /tmp/ptmc_native_view
+          xcrun clang -fobjc-arc -O2 -Werror -Wno-deprecated-declarations -framework Cocoa -framework Metal -framework QuartzCore -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework AVFoundation tests/ptmc_runtime_smoke.m -o /tmp/ptmc_runtime_smoke
       - name: Build
         run: PTMC_VERSION=0.1.0 scripts/ptmc_build_on_mac.sh
       - name: Validate
