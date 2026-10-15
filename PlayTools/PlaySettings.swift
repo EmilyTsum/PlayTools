@@ -44,7 +44,7 @@ func playCoverContainerBaseURL() -> URL {
     var settingsData: AppSettingsData
 
     override init() {
-        settingsUrl = playCoverContainerBaseURL()
+        settingsUrl = URL(fileURLWithPath: "/Users/\(NSUserName())/Library/Containers/io.playcover.PlayCover")
             .appendingPathComponent("App Settings")
             .appendingPathComponent("\(bundleIdentifier).plist")
         do {

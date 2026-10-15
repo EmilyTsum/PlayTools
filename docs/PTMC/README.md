@@ -72,3 +72,20 @@ python3 tests/ptmc_scheduler_model.py
 The patch-roundtrip test exists to keep the historical overlay/rebase mechanism reproducible; the active product is the committed `metal-capture` branch, not a generated overlay build.
 
 macOS CI additionally compiles the Metal shader, builds/validates the framework, verifies its Catalyst metadata/signature, and uploads an artifact. Physical game FPS, rare capture drops, HUD exclusion, and A/V sync are real-device acceptance tests, not CI claims.
+
+## October 2026 PlayTools 4.x port / preview investigation
+
+PTMC is reapplied on the current upstream `master` at `fbc8880` rather than replacing
+PlayTools 4.x input, plugins, and security fixes with an older binary. The capture path
+continues to forward the original drawable present whenever preview is visible; no unsafe
+headless present bypass is enabled by default.
+
+Capture status now separates present pacing gaps above 1.5 times the requested frame
+interval (`presentGapsOverBudget`, `maxPresentGapUs`) from intentional sampling skips and
+raw-pool/encoder drops. Compare two equivalent workloads with visible preview on and
+off; these counters alone do not attribute the gap to WindowServer or the game GPU.
+
+The host's low-latency preview experiment turns display synchronization off for the
+recording while retaining drawable presentation. This may reduce blocking on some
+macOS/game combinations, but can increase GPU load. Do not claim drop-free preview
+without a matched real-device capture comparison.

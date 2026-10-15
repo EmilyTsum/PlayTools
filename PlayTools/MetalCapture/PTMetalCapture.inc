@@ -275,6 +275,8 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_uint_fast64_t _droppedEncoder;
     atomic_uint_fast64_t _droppedLate;
     atomic_uint_fast64_t _droppedUnsupported;
+    atomic_uint_fast64_t _presentGapsOverBudget;
+    atomic_uint_fast64_t _maxPresentGapUs;
     atomic_uint_fast64_t _skippedRate;
     atomic_uint_fast64_t _lastLogSkipped;
     atomic_uint_fast64_t _samplingSkipMilliFPS;
@@ -383,6 +385,8 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
         status[@"samplingSkipped"] = @(samplingSkipped);
         status[@"samplingSkipPerSecond"] = @((double)atomic_load_explicit(
             &manager->_samplingSkipMilliFPS, memory_order_relaxed) / 1000.0);
+        status[@"presentGapsOverBudget"] = @(atomic_load_explicit(&manager->_presentGapsOverBudget, memory_order_relaxed));
+        status[@"maxPresentGapUs"] = @(atomic_load_explicit(&manager->_maxPresentGapUs, memory_order_relaxed));
         status[@"presentFPS"] = @((double)atomic_load_explicit(
             &manager->_presentMilliFPS, memory_order_relaxed) / 1000.0);
         status[@"captureFPS"] = @((double)atomic_load_explicit(
@@ -1024,6 +1028,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         atomic_init(&_presented, 0); atomic_init(&_captured, 0); atomic_init(&_encoded, 0);
         atomic_init(&_droppedPool, 0); atomic_init(&_droppedEncoder, 0); atomic_init(&_droppedLate, 0);
         atomic_init(&_droppedUnsupported, 0); atomic_init(&_skippedRate, 0);
+        atomic_init(&_presentGapsOverBudget, 0); atomic_init(&_maxPresentGapUs, 0);
         atomic_init(&_lastLogSkipped, 0); atomic_init(&_samplingSkipMilliFPS, 0);
         atomic_init(&_lastLogTick, mach_continuous_time());
         atomic_init(&_lastLogPresented, 0); atomic_init(&_lastLogCaptured, 0); atomic_init(&_lastLogEncoded, 0);
@@ -1105,6 +1110,8 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     atomic_store_explicit(&_droppedEncoder, 0, memory_order_relaxed);
     atomic_store_explicit(&_droppedLate, 0, memory_order_relaxed);
     atomic_store_explicit(&_droppedUnsupported, 0, memory_order_relaxed);
+    atomic_store_explicit(&_presentGapsOverBudget, 0, memory_order_relaxed);
+    atomic_store_explicit(&_maxPresentGapUs, 0, memory_order_relaxed);
     atomic_store_explicit(&_skippedRate, 0, memory_order_relaxed);
     atomic_store_explicit(&_lastLogSkipped, 0, memory_order_relaxed);
     atomic_store_explicit(&_samplingSkipMilliFPS, 0, memory_order_relaxed);
@@ -1243,6 +1250,17 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     uint64_t presentEWMA = atomic_load_explicit(&session->_presentIntervalEWMATicks, memory_order_relaxed);
     if (lastPresent != 0 && tick > lastPresent) {
         uint64_t sample = tick - lastPresent;
+        // Use recent *source* cadence (capped at the capture target) so a 120 Hz game
+        // captured at 60 fps still reports a missed 120 Hz display present.
+        // This does not attribute the stall to WindowServer rather than game rendering.
+        uint64_t expectedPresentInterval = presentEWMA > 0 ? MIN(presentEWMA, interval) : interval;
+        if (sample > expectedPresentInterval + expectedPresentInterval / 2) {
+            atomic_fetch_add_explicit(&_presentGapsOverBudget, 1, memory_order_relaxed);
+        }
+        uint64_t gapUs = ptmc_ticks_to_ns(sample) / 1000u;
+        uint64_t oldMax = atomic_load_explicit(&_maxPresentGapUs, memory_order_relaxed);
+        while (gapUs > oldMax && !atomic_compare_exchange_weak_explicit(
+                   &_maxPresentGapUs, &oldMax, gapUs, memory_order_relaxed, memory_order_relaxed)) {}
         presentEWMA = presentEWMA == 0 ? sample : (presentEWMA * 7 + sample) / 8;
         atomic_store_explicit(&session->_presentIntervalEWMATicks, presentEWMA, memory_order_relaxed);
     }
@@ -1488,6 +1506,9 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
              (unsigned long long)samplingSkipped, skipPerSecond, self.codecName ?: @"hevc",
              self.captureResolutionMode ?: @"source", self.suppressDisplayOutput, self.skipDisplayPresent,
              atomic_load(&_requested));
+    PTMC_LOG(@"present pacing: gaps_over_1.5x_target=%llu max_gap_us=%llu",
+             (unsigned long long)atomic_load(&_presentGapsOverBudget),
+             (unsigned long long)atomic_load(&_maxPresentGapUs));
     BOOL requested = atomic_load_explicit(&_requested, memory_order_acquire);
     if (force || requested) {
         PTMCSession *session = self.session;
