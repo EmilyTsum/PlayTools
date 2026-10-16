@@ -44,7 +44,7 @@ the original game view before navigating. It primarily targets MV viewing.
 
 ## Initial validation
 
-Native 4K60 clear-pass producer with an independent panel: 466 captured/encoded,
+Native 4K60 clear-pass producer with an independent panel: 465 captured/encoded,
 zero pool/encoder drops; 465 preview submissions/presents, source max nextDrawable
 call 0.695 ms. Source
 sync/opacity and hook restoration pass after Stop.
