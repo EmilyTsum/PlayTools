@@ -96,7 +96,8 @@ See [preview validation](PREVIEW_VALIDATION_20261015.md) for the bounded writer 
 serialized lifecycle, native sRGB view optimization, diagnostics, native GPU/codec tests,
 and the remaining game/device acceptance plan. Idle heartbeats preserve the finalized/error
 result. Native smoke tests are not evidence that the reported real-game visible-preview
-stall has been fixed; independent preview remains unimplemented.
+stall has been fixed. The October 16 opt-in independent preview window is documented
+in [INDEPENDENT_PREVIEW.md](INDEPENDENT_PREVIEW.md); matched MV acceptance remains open.
 
 The same validation document now includes a short real ミリシタ MV smoke: visible 3840x2160
 HEVC 4:2:2/60 captured and wrote 1190 frames without pool/encoder drops. It is video-only,

@@ -1,3 +1,5 @@
+> Historical October 15 evidence. The October 16 independent preview experiment is described in [INDEPENDENT_PREVIEW.md](INDEPENDENT_PREVIEW.md); its matched MV acceptance is still open.
+
 # Preview performance work, 2026-10-15
 
 Status: experimental. The real-game visible-preview stall is **not resolved or attributed** by
