@@ -30,7 +30,11 @@ int main(int argc, const char **argv) { @autoreleasepool {
     layer.device = MTLCreateSystemDefaultDevice(); layer.pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
     layer.framebufferOnly = NO; layer.drawableSize = CGSizeMake(3840,2160);
     layer.frame = window.contentView.bounds;
-    window.contentView.wantsLayer = YES; window.contentView.layer = layer;
+    window.contentView.wantsLayer = YES;
+    CALayer *root = [CALayer layer]; root.frame = window.contentView.bounds;
+    BOOL rootLayer = ptmc_env_bool("PTMC_SMOKE_ROOT_LAYER", NO);
+    if (rootLayer) { window.contentView.layer = layer; }
+    else { window.contentView.layer = root; [root addSublayer:layer]; }
     [window orderFront:nil];
     id<MTLCommandQueue> queue = [layer.device newCommandQueue];
     PTMCManager *manager = ptmc_manager();
@@ -39,6 +43,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent()+seconds;
     BOOL stallWriter = ptmc_env_bool("PTMC_SMOKE_STALL_WRITER", NO);
     __block BOOL stalled = NO;
+    __block BOOL previewStalled = NO;
     BOOL repeat = ptmc_env_bool("PTMC_SMOKE_REPEAT", NO);
     __block BOOL restarted = NO;
     __block NSUInteger frames=0; __block uint64_t maxDrawableUs=0;
@@ -62,6 +67,11 @@ int main(int argc, const char **argv) { @autoreleasepool {
         if (stallWriter && !stalled && manager.session) {
             stalled = YES;
             dispatch_async(manager.session.writerQueue, ^{ usleep(2 * 1000000); });
+        }
+        if (ptmc_env_bool("PTMC_SMOKE_STALL_PREVIEW", NO) && !previewStalled && manager.preview &&
+            CFAbsoluteTimeGetCurrent() >= deadline-seconds/2) {
+            previewStalled = YES;
+            dispatch_async(manager.preview.worker, ^{ usleep(2 * 1000000); });
         }
         uint64_t start=mach_continuous_time(); id<CAMetalDrawable> drawable=[layer nextDrawable];
         maxDrawableUs=MAX(maxDrawableUs,ptmc_ticks_to_ns(mach_continuous_time()-start)/1000);
@@ -96,5 +106,12 @@ int main(int argc, const char **argv) { @autoreleasepool {
     // Detect duplicated logical presents without requiring precise timer scheduling under load.
     double activeSeconds = repeat ? seconds/2 : seconds;
     valid = valid && [status[@"presented"] doubleValue] <= activeSeconds*fps*1.25;
+    if (ptmc_env_bool("PTMC_INDEPENDENT_PREVIEW", NO)) {
+        NSLog(@"preview submitted=%@ presented=%@ skipped=%@ size=%@x%@ remainingLayers=%lu",
+            status[@"previewSubmitted"], status[@"previewPresented"], status[@"previewSkipped"],
+            status[@"previewWidth"], status[@"previewHeight"], (unsigned long)root.sublayers.count);
+        valid = valid && [status[@"previewPresented"] unsignedLongLongValue] > 0;
+        if (!rootLayer) valid = valid && root.sublayers.count == 1;
+    }
     [window orderOut:nil]; return valid ? 0 : 1;
 } }

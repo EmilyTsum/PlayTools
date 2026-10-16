@@ -102,3 +102,5 @@ The same validation document now includes a short real ミリシタ MV smoke: vi
 HEVC 4:2:2/60 captured and wrote 1190 frames without pool/encoder drops. It is video-only,
 uses the existing installed AKInterface plugin, and does not replace the sustained/matched
 MV, 120 fps, audio, or complete installation acceptance gates.
+
+Independent preview implementation and limits: [INDEPENDENT_PREVIEW.md](INDEPENDENT_PREVIEW.md).

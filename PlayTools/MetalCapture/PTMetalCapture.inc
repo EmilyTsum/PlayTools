@@ -190,6 +190,199 @@ static NSString *ptmc_output_path_from_environment(void) {
     return ptmc_timestamped_output_path(directory);
 }
 
+
+// Recording owns no display drawable: three small private textures transfer completed GPU
+// snapshots to a separate queue. nextDrawable/presentation can block only that preview worker.
+@interface PTMCPreview : NSObject {
+@public
+    atomic_bool active;
+    atomic_bool attached;
+    atomic_bool displaying;
+    atomic_bool busy[3];
+    atomic_uint_fast64_t submitted;
+    atomic_uint_fast64_t presented;
+    atomic_uint_fast64_t skipped;
+    atomic_uint_fast64_t nextTick;
+    atomic_uint_fast64_t lastShown;
+    atomic_uint_fast64_t latestSnapshot;
+}
+@property(nonatomic, strong) CAMetalLayer *layer;
+@property(nonatomic, strong) CAMetalLayer *sourceLayer;
+@property(nonatomic, strong) id<MTLCommandQueue> queue;
+@property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
+@property(nonatomic, strong) NSArray<id<MTLTexture>> *textures;
+@property(nonatomic) dispatch_queue_t worker;
+@property(nonatomic) float originalOpacity;
+@property(nonatomic) dispatch_source_t layoutTimer;
+@property(nonatomic, strong) id window;
+- (instancetype)initWithDevice:(id<MTLDevice>)device width:(NSUInteger)width height:(NSUInteger)height;
+- (void)attachTo:(CAMetalLayer *)source;
+- (void)encodeTexture:(id<MTLTexture>)source srgb:(BOOL)srgb commandBuffer:(id<MTLCommandBuffer>)cb tick:(uint64_t)tick;
+- (void)invalidate;
+@end
+
+@implementation PTMCPreview
+- (instancetype)initWithDevice:(id<MTLDevice>)device width:(NSUInteger)width height:(NSUInteger)height {
+    if (!(self = [super init])) return nil;
+    atomic_init(&active, true); atomic_init(&attached, false); atomic_init(&displaying, false);
+    atomic_init(&submitted, 0); atomic_init(&presented, 0); atomic_init(&skipped, 0);
+    atomic_init(&nextTick, 0); atomic_init(&lastShown, 0); atomic_init(&latestSnapshot, 0);
+    for (unsigned i = 0; i < 3; i++) atomic_init(&busy[i], false);
+    double scale = MIN(1.0, MIN(1280.0 / MAX(width, 1u), 720.0 / MAX(height, 1u)));
+    NSUInteger w = MAX(1, (NSUInteger)(width * scale)), h = MAX(1, (NSUInteger)(height * scale));
+    NSString *shader = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void preview(texture2d<float,access::sample> s [[texture(0)]],"
+        "texture2d<float,access::write> d [[texture(1)]], constant uint &srgb [[buffer(0)]],"
+        "uint2 p [[thread_position_in_grid]]) { if(p.x>=d.get_width()||p.y>=d.get_height())return;"
+        "constexpr sampler q(coord::normalized,address::clamp_to_edge,filter::linear);"
+        "float3 c=s.sample(q,(float2(p)+0.5)/float2(d.get_width(),d.get_height())).rgb;"
+        "if(srgb)c=select(12.92*c,1.055*pow(max(c,float3(0)),float3(1.0/2.4))-0.055,c>0.0031308);"
+        "d.write(float4(c,1),p); }";
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:shader options:nil error:&error];
+    id<MTLFunction> function = [library newFunctionWithName:@"preview"];
+    if (!function) { PTMC_LOG(@"preview shader unavailable: %@", error); return nil; }
+    self.pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    self.queue = [device newCommandQueue]; self.queue.label = @"PTMC Independent Preview";
+    if (!self.pipeline || !self.queue) return nil;
+    NSMutableArray *textures = [NSMutableArray arrayWithCapacity:3];
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+        width:w height:h mipmapped:NO];
+    desc.storageMode = MTLStorageModePrivate; desc.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+    for (unsigned i = 0; i < 3; i++) {
+        id<MTLTexture> texture = [device newTextureWithDescriptor:desc];
+        if (!texture) return nil;
+        texture.label = @"PTMC Preview Mailbox"; [textures addObject:texture];
+    }
+    self.textures = textures;
+    self.worker = dispatch_queue_create("io.playcover.ptmc.preview", DISPATCH_QUEUE_SERIAL);
+    self.layer = [CAMetalLayer layer]; self.layer.device = device;
+    self.layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    self.layer.drawableSize = CGSizeMake(w,h); self.layer.framebufferOnly = NO;
+    self.layer.maximumDrawableCount = 2; self.layer.presentsWithTransaction = NO;
+    SEL sync = NSSelectorFromString(@"setDisplaySyncEnabled:");
+    if ([self.layer respondsToSelector:sync]) ((void (*)(id,SEL,BOOL))objc_msgSend)(self.layer,sync,NO);
+    CGColorSpaceRef colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    self.layer.colorspace = colorspace; CGColorSpaceRelease(colorspace);
+    return self;
+}
+- (void)attachTo:(CAMetalLayer *)source {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!source || !atomic_load_explicit(&self->active, memory_order_acquire)) return;
+        // Keep UIKit's game/view-controller hierarchy untouched. Catalyst already loads AppKit
+        // through AKInterface; resolve public AppKit classes dynamically in the iOS-built runtime.
+        Class panelClass = NSClassFromString(@"NSPanel");
+        if (!panelClass) { PTMC_LOG(@"AppKit preview unavailable; keeping native display"); return; }
+        self.sourceLayer = source; self.originalOpacity = source.opacity;
+        CGFloat aspect = (CGFloat)self.textures.firstObject.width / self.textures.firstObject.height;
+        CGRect frame = CGRectMake(100,100,MIN(960,540*aspect),MIN(540,960/aspect));
+        // titled, resizable, nonactivating; no close button while the recording owns this window.
+        id panel = ((id (*)(id,SEL,CGRect,NSUInteger,NSUInteger,BOOL))objc_msgSend)([panelClass alloc],
+            NSSelectorFromString(@"initWithContentRect:styleMask:backing:defer:"), frame, 1u|8u|128u, 2u, NO);
+        if (!panel) return;
+        self.window = panel;
+        ((void (*)(id,SEL,NSInteger))objc_msgSend)(panel, NSSelectorFromString(@"setLevel:"), 3);
+        ((void (*)(id,SEL,BOOL))objc_msgSend)(panel, NSSelectorFromString(@"setExcludedFromWindowsMenu:"), NO);
+        ((void (*)(id,SEL,id))objc_msgSend)(panel, NSSelectorFromString(@"setTitle:"), @"PTMC Preview (recording quality unchanged)");
+        ((void (*)(id,SEL,BOOL))objc_msgSend)(panel, NSSelectorFromString(@"setHidesOnDeactivate:"), NO);
+        ((void (*)(id,SEL,BOOL))objc_msgSend)(panel, NSSelectorFromString(@"setReleasedWhenClosed:"), NO);
+        id view = ((id (*)(id,SEL))objc_msgSend)(panel, NSSelectorFromString(@"contentView"));
+        ((void (*)(id,SEL,BOOL))objc_msgSend)(view, NSSelectorFromString(@"setWantsLayer:"), YES);
+        ((void (*)(id,SEL,id))objc_msgSend)(view, NSSelectorFromString(@"setLayer:"), self.layer);
+        ((void (*)(id,SEL,id))objc_msgSend)(panel, NSSelectorFromString(@"orderFront:"), nil);
+        PTMC_LOG(@"independent preview window attached; source opacity=%.2f", self.originalOpacity);
+        atomic_store_explicit(&self->attached, true, memory_order_release);
+        self.layoutTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(self.layoutTimer, DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC, 10 * NSEC_PER_MSEC);
+        __weak PTMCPreview *weakSelf = self;
+        dispatch_source_set_event_handler(self.layoutTimer, ^{
+            PTMCPreview *preview = weakSelf;
+            if (!preview || !atomic_load(&preview->active)) return;
+            uint64_t shown = atomic_load(&preview->lastShown);
+            BOOL visible = ((BOOL (*)(id,SEL))objc_msgSend)(preview.window, NSSelectorFromString(@"isVisible"));
+            BOOL healthy = visible && shown && mach_continuous_time() - shown < ptmc_ns_to_ticks(250000000ull);
+            atomic_store(&preview->displaying, healthy);
+            [CATransaction begin]; [CATransaction setDisableActions:YES];
+            source.opacity = healthy ? 0 : preview.originalOpacity;
+            [CATransaction commit];
+        });
+        dispatch_resume(self.layoutTimer);
+    });
+}
+- (void)encodeTexture:(id<MTLTexture>)source srgb:(BOOL)srgb commandBuffer:(id<MTLCommandBuffer>)cb tick:(uint64_t)tick {
+    if (!atomic_load_explicit(&active, memory_order_acquire) ||
+        !atomic_load_explicit(&attached, memory_order_acquire)) return;
+    uint64_t next = atomic_load(&nextTick);
+    uint64_t interval = ptmc_ns_to_ticks(1000000000ull / 60);
+    if (next && tick + interval / 32 < next) return;
+    // Preview cadence is independent of recording cadence; no intentional recording sampling here.
+    uint64_t advanced = !next || tick > next + interval * 4 ? tick + interval : next + interval;
+    if (!atomic_compare_exchange_strong(&nextTick, &next, advanced)) return;
+    unsigned index = 3;
+    for (unsigned i = 0; i < 3; i++) {
+        bool expected = false;
+        if (atomic_compare_exchange_strong_explicit(&busy[i], &expected, true,
+                memory_order_acq_rel, memory_order_relaxed)) { index = i; break; }
+    }
+    if (index == 3) { atomic_fetch_add(&skipped, 1); return; }
+    id<MTLComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+    if (!encoder) { atomic_store(&busy[index], false); return; }
+    id<MTLTexture> snapshot = self.textures[index];
+    encoder.label = @"PTMC Preview Downsample";
+    [encoder setComputePipelineState:self.pipeline];
+    [encoder setTexture:source atIndex:0]; [encoder setTexture:snapshot atIndex:1];
+    uint32_t value = srgb; [encoder setBytes:&value length:sizeof(value) atIndex:0];
+    NSUInteger w = self.pipeline.threadExecutionWidth;
+    NSUInteger h = MIN(16, MAX(1, self.pipeline.maxTotalThreadsPerThreadgroup / w));
+    [encoder dispatchThreads:MTLSizeMake(snapshot.width,snapshot.height,1)
+        threadsPerThreadgroup:MTLSizeMake(w,h,1)]; [encoder endEncoding];
+    uint64_t sequence = atomic_fetch_add(&submitted, 1) + 1;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status != MTLCommandBufferStatusCompleted || !atomic_load(&self->active)) {
+            atomic_store(&self->busy[index], false); return;
+        }
+        atomic_store(&self->latestSnapshot, sequence);
+        dispatch_async(self.worker, ^{ @autoreleasepool {
+            if (!atomic_load(&self->active) || sequence != atomic_load(&self->latestSnapshot)) {
+                atomic_fetch_add(&self->skipped, 1); atomic_store(&self->busy[index], false); return;
+            }
+            id<CAMetalDrawable> drawable = [self.layer nextDrawable];
+            if (!drawable || !atomic_load(&self->active)) {
+                atomic_fetch_add(&self->skipped, 1); atomic_store(&self->busy[index], false); return;
+            }
+            id<MTLCommandBuffer> display = [self.queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [display blitCommandEncoder];
+            if (!display || !blit) { atomic_store(&self->busy[index], false); return; }
+            [blit copyFromTexture:snapshot sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                sourceSize:MTLSizeMake(snapshot.width,snapshot.height,1) toTexture:drawable.texture
+                destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+            [blit endEncoding]; [display presentDrawable:drawable];
+            [display addCompletedHandler:^(id<MTLCommandBuffer> shown) {
+                atomic_store(&self->busy[index], false);
+                if (shown.status != MTLCommandBufferStatusCompleted || !atomic_load(&self->active)) return;
+                atomic_fetch_add(&self->presented, 1);
+                atomic_store(&self->lastShown, mach_continuous_time());
+            }]; [display commit];
+        }});
+    }];
+}
+- (void)invalidate {
+    atomic_store_explicit(&active, false, memory_order_release);
+    atomic_store(&displaying, false); atomic_store(&attached, false);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [CATransaction begin]; [CATransaction setDisableActions:YES];
+        if (self.layoutTimer) { dispatch_source_cancel(self.layoutTimer); self.layoutTimer = nil; }
+        if (self.window) {
+            ((void (*)(id,SEL))objc_msgSend)(self.window, NSSelectorFromString(@"close"));
+            self.window = nil;
+        }
+        if (self.sourceLayer) self.sourceLayer.opacity = self.originalOpacity;
+        PTMC_LOG(@"independent preview removed; source opacity=%.2f", self.sourceLayer.opacity);
+        [CATransaction commit];
+    });
+}
+@end
+
 @class PTMCSession;
 
 @interface PTMCSlot : NSObject {
@@ -245,6 +438,7 @@ static NSString *ptmc_output_path_from_environment(void) {
     atomic_int_fast64_t _lastPTSUnits;
 }
 @property(atomic, copy) NSString *failureMessage;
+@property(nonatomic, strong) PTMCPreview *preview;
 @property(nonatomic) uint64_t generation;
 @property(nonatomic) NSUInteger sourceWidth;
 @property(nonatomic) NSUInteger sourceHeight;
@@ -336,6 +530,8 @@ static NSString *ptmc_output_path_from_environment(void) {
     CGColorSpaceRef _originalColorSpace;
 }
 @property(atomic, strong) PTMCSession *session;
+@property(atomic, strong) PTMCPreview *preview;
+@property(nonatomic) BOOL independentPreview;
 @property(nonatomic) dispatch_queue_t controlQueue;
 @property(nonatomic) NSInteger fps;
 @property(nonatomic) NSInteger bitrate;
@@ -432,6 +628,16 @@ static void ptmc_publish_status(PTMCManager *manager, PTMCSession *session, NSSt
         status[@"presentHookCount"] = @(atomic_load_explicit(&manager->_presentHookCount, memory_order_relaxed));
         status[@"presentPath"] = ptmc_present_path_name();
         status[@"captureEnabled"] = @(manager.captureEnabled);
+        PTMCPreview *preview = manager.preview ?: session.preview;
+        status[@"independentPreviewRequested"] = @(manager.independentPreview);
+        status[@"independentPreviewActive"] = @(preview && atomic_load(&preview->displaying));
+        if (preview) {
+            status[@"previewSubmitted"] = @(atomic_load(&preview->submitted));
+            status[@"previewPresented"] = @(atomic_load(&preview->presented));
+            status[@"previewSkipped"] = @(atomic_load(&preview->skipped));
+            status[@"previewWidth"] = @(preview.textures.firstObject.width);
+            status[@"previewHeight"] = @(preview.textures.firstObject.height);
+        }
         status[@"displaySuppressed"] = @(manager.suppressDisplayOutput);
         status[@"displayPresentSkipped"] = @(manager.skipDisplayPresent);
         status[@"includeMetalHUDInCapture"] = @(manager.includeMetalHUDInCapture);
@@ -1190,6 +1396,7 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
     self.logInterval = ptmc_runtime_double(config, @"logInterval", "PTMC_LOG_INTERVAL", 1.0, 0.25, 60.0);
     self.disableDisplaySync = ptmc_runtime_bool(config, @"disableDisplaySync", "PTMC_DISABLE_DISPLAY_SYNC", NO);
     self.forceSDRDisplay = ptmc_runtime_bool(config, @"forceSDRDisplay", "PTMC_FORCE_SDR_DISPLAY", YES);
+    self.independentPreview = ptmc_runtime_bool(config, @"independentPreview", "PTMC_INDEPENDENT_PREVIEW", NO);
     self.suppressDisplayOutput = ptmc_runtime_bool(config, @"suppressDisplayOutput", "PTMC_SUPPRESS_DISPLAY", NO);
     self.skipDisplayPresent = ptmc_runtime_bool(config, @"skipDisplayPresent", "PTMC_SKIP_DISPLAY_PRESENT", NO);
     self.includeMetalHUDInCapture = ptmc_runtime_bool(config, @"includeMetalHUDInCapture", "PTMC_CAPTURE_METAL_HUD", NO);
@@ -1346,6 +1553,11 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
         s.outputPath = ptmc_output_path_from_environment();
         BOOL ok = ptmc_create_pipelines(s) && ptmc_create_slots(s) && ptmc_create_video_session(s);
         if (ok && atomic_load_explicit(&self->_requested, memory_order_acquire)) {
+            if (self.independentPreview && !self.skipDisplayPresent && !self.suppressDisplayOutput) {
+                self.preview = [[PTMCPreview alloc] initWithDevice:device width:sourceWidth height:sourceHeight];
+                s.preview = self.preview;
+                [self.preview attachTo:self.captureLayer];
+            }
             self.session = s;
             PTMC_LOG(@"capture armed generation=%llu source=%lux%lu capture=%lux%lu codec=%@ buffers=%ld output=%@",
                      (unsigned long long)s.generation,
@@ -1548,6 +1760,8 @@ static BOOL ptmc_create_pipelines(PTMCSession *session) {
             destinationOrigin:MTLOriginMake(0, 0, 0)];
         [blit endEncoding];
     }
+
+    [session.preview encodeTexture:texture srgb:sourceSRGB commandBuffer:activeCmdBuffer tick:tick];
 
     // Correlate the first admitted capture's present tick with the host audio clock.
     // Do not anchor A/V sync to a frame rejected by GPU/raw-pool admission.
@@ -1833,6 +2047,7 @@ static void ptmc_apply_hud_capture_policy(CAMetalLayer *layer, PTMCManager *mana
 }
 
 static void ptmc_restore_capture_layer(PTMCManager *manager) {
+    [manager.preview invalidate]; manager.preview = nil;
     CAMetalLayer *layer = manager.captureLayer;
     if (!layer) {
         atomic_store_explicit(&manager->_captureLayerAddress, 0, memory_order_release);
@@ -1951,7 +2166,10 @@ static void ptmc_prepare_capture_layer(CAMetalLayer *layer, PTMCManager *manager
         if (differs) layer.colorspace = original;
     }
     // Full headless mode skips present itself; changing opacity would only create an extra CA transaction.
-    float desiredOpacity = (!manager.skipDisplayPresent && manager.suppressDisplayOutput) ? 0.0f : manager->_originalOpacity;
+    PTMCPreview *preview = manager.preview;
+    BOOL previewVisible = preview && atomic_load_explicit(&preview->displaying, memory_order_acquire);
+    float desiredOpacity = (!manager.skipDisplayPresent && (manager.suppressDisplayOutput || previewVisible))
+        ? 0.0f : manager->_originalOpacity;
     if (fabsf(layer.opacity - desiredOpacity) > 0.0001f) {
         // Keep calling present so CAMetalDrawable objects recycle normally. Making the layer fully
         // transparent is the safe optional "capture-only" mode; WindowServer may cull the visible
@@ -1988,8 +2206,11 @@ static NSString *ptmc_present_path_name(void) {
 
 static BOOL ptmc_record_present(id commandBuffer, id<CAMetalDrawable> drawable, PTMCPresentPath path) {
     if (!atomic_load_explicit(&ptmc_recording_fast, memory_order_acquire)) return NO;
-    if (!ptmc_claim_present_path(path)) return NO;
     PTMCManager *manager = ptmc_manager();
+    // Preview is another Metal producer in this process. Never capture it recursively or let it
+    // select the game's presentation route.
+    if (drawable.layer == manager.preview.layer) return NO;
+    if (!ptmc_claim_present_path(path)) return NO;
     ptmc_prepare_capture_layer(drawable.layer, manager);
     uint64_t tick = mach_continuous_time();
     atomic_fetch_add_explicit(&manager->_presented, 1, memory_order_relaxed);
