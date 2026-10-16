@@ -339,7 +339,9 @@ class AKPlugin: NSObject, Plugin {
 
     fileprivate static var akAppSettingsData: AKAppSettingsData? = {
         let bundleIdentifier = Bundle.main.bundleIdentifier ?? ""
-        let settingsURL = akSettingsURLForBundleIdentifier(bundleIdentifier)
+        let settingsURL = URL(fileURLWithPath: "/Users/\(NSUserName())/Library/Containers/io.playcover.PlayCover")
+            .appendingPathComponent("App Settings")
+            .appendingPathComponent("\(bundleIdentifier).plist")
         guard let data = try? Data(contentsOf: settingsURL),
               let decoded = try? PropertyListDecoder().decode(AKAppSettingsData.self, from: data) else {
             return nil

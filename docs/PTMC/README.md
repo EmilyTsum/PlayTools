@@ -13,7 +13,7 @@ Real Apple Silicon testing established the following facts:
 - The decisive Unity path observed later was direct `CAMetalDrawable.present*`, so direct drawable hooks are the preferred path; command-buffer interception is a compatibility fallback.
 - Repeated per-frame CAMetalLayer state writes caused measurable pacing disturbance. Capture-layer state is now prepared once when needed and restored on Stop.
 - A 120 Hz source captured at 60 fps should intentionally report roughly 60 sampling skips/s. `samplingSkipped` is not an encoder-drop counter.
-- A deeper GPU work queue can worsen game pacing at 4K. GPU admission therefore remains capped at the configured default of 3, independently of three additional preallocated raw surfaces that absorb VideoToolbox residency latency after Metal work completes.
+- A deeper GPU work queue can worsen game pacing at 4K. GPU admission therefore remains capped at the configured default of 3, independently of `max(3, ceil(fps * 0.075))` additional preallocated raw surfaces (75 ms encoder-residency budget) that absorb VideoToolbox residency latency after Metal work completes.
 
 ## Current capture path
 
@@ -72,3 +72,36 @@ python3 tests/ptmc_scheduler_model.py
 The patch-roundtrip test exists to keep the historical overlay/rebase mechanism reproducible; the active product is the committed `metal-capture` branch, not a generated overlay build.
 
 macOS CI additionally compiles the Metal shader, builds/validates the framework, verifies its Catalyst metadata/signature, and uploads an artifact. Physical game FPS, rare capture drops, HUD exclusion, and A/V sync are real-device acceptance tests, not CI claims.
+
+## October 2026 PlayTools 4.x port / preview investigation
+
+PTMC is reapplied on the current upstream `master` at `fbc8880` rather than replacing
+PlayTools 4.x input, plugins, and security fixes with an older binary. The capture path
+continues to forward the original drawable present whenever preview is visible; no unsafe
+headless present bypass is enabled by default.
+
+Capture status now separates present pacing gaps above 1.5 times the requested frame
+interval (`presentGapsOverBudget`, `maxPresentGapUs`) from intentional sampling skips and
+raw-pool/encoder drops. Compare two equivalent workloads with visible preview on and
+off; these counters alone do not attribute the gap to WindowServer or the game GPU.
+
+The host's low-latency preview experiment turns display synchronization off for the
+recording while retaining drawable presentation. This may reduce blocking on some
+macOS/game combinations, but can increase GPU load. Do not claim drop-free preview
+without a matched real-device capture comparison.
+
+## October 15 follow-up implementation and evidence
+
+See [preview validation](PREVIEW_VALIDATION_20261015.md) for the bounded writer handoff,
+serialized lifecycle, native sRGB view optimization, diagnostics, native GPU/codec tests,
+and the remaining game/device acceptance plan. Idle heartbeats preserve the finalized/error
+result. Native smoke tests are not evidence that the reported real-game visible-preview
+stall has been fixed. The October 16 opt-in independent preview window is documented
+in [INDEPENDENT_PREVIEW.md](INDEPENDENT_PREVIEW.md); matched MV acceptance remains open.
+
+The same validation document now includes a short real ミリシタ MV smoke: visible 3840x2160
+HEVC 4:2:2/60 captured and wrote 1190 frames without pool/encoder drops. It is video-only,
+uses the existing installed AKInterface plugin, and does not replace the sustained/matched
+MV, 120 fps, audio, or complete installation acceptance gates.
+
+Independent preview implementation and limits: [INDEPENDENT_PREVIEW.md](INDEPENDENT_PREVIEW.md).

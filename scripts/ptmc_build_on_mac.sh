@@ -3,6 +3,13 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 [[ $(uname -s) == Darwin ]] || { echo "ptmc_build_on_mac.sh requires macOS" >&2; exit 2; }
 for cmd in git xcodebuild xcrun codesign ditto; do command -v "$cmd" >/dev/null || { echo "missing: $cmd" >&2; exit 2; }; done
+# The upstream snapshot can be imported without its commit object in this fork's ancestry.
+# Fetch that exact public commit when necessary, then fail closed if it cannot be resolved.
+UPSTREAM_PIN=$(cat "$ROOT/PTMC_UPSTREAM_COMMIT")
+if ! git -C "$ROOT" cat-file -e "$UPSTREAM_PIN^{commit}" 2>/dev/null; then
+  git -C "$ROOT" fetch --no-tags --depth=1 https://github.com/PlayCover/PlayTools.git "$UPSTREAM_PIN"
+fi
+UPSTREAM_COMMIT=$(git -C "$ROOT" rev-parse --verify "$UPSTREAM_PIN^{commit}")
 WORK=${PTMC_BUILD_DIR:-$ROOT/.ptmc-build}
 PRODUCTS="$WORK/Products"
 OBJ_AK="$WORK/Intermediates-AK"
@@ -75,7 +82,7 @@ BIN="$FRAME/PlayTools"
 codesign --force --deep --sign - "$FRAME"
 {
   echo "fork_commit=$(git -C "$ROOT" rev-parse HEAD)"
-  echo "upstream_commit=$(git -C "$ROOT" rev-parse upstream/master 2>/dev/null || true)"
+  echo "upstream_commit=$UPSTREAM_COMMIT"
   echo "macos_sdk=$MACOS_SDK"
   echo "catalyst_min=$MIN_CATALYST"
   xcrun vtool -show-build "$BIN"
